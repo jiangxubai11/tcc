@@ -1,0 +1,205 @@
+// =============================================================================
+//  tclib/gfx/yuv.tc — YUV 4:2:0 → BGRA 转换与缩放绘制
+// -----------------------------------------------------------------------------
+//  · 查表 + 整数运算的 BT.601 limited-range 转换（无浮点、无逐像素除法）
+//  · yuv420ToBgra     ：整帧转换到任意 BGRA 缓冲
+//  · yuv420DrawScaled ：直接缩放绘制到画布（最近邻采样，供播放器呈现）
+//  · yuv420MakeTest   ：生成离线自检图案
+//
+//  查表设计：把 8 位精度公式的系数预先算进 5 张 256 项 i32 表：
+//    R = (tY[y] + tRV[v] + 128) >> 8
+//    G = (tY[y] + tGU[u] + tGV[v] + 128) >> 8
+//    B = (tY[y] + tBU[u] + 128) >> 8
+//  表在首次调用时惰性初始化（全局量初值不支持复杂表达式）。
+//
+//  性能备注：当前为标量 + 查表实现（每像素 4 次表读 + 3 次移位 + 3 次 clamp）。
+//  SSE 向量化依赖编译器的 SIMD 内建（见 docs/LANGUAGE.md §13.2「规划中」），
+//  待该能力落地后在此文件增量替换（接口不变）。
+// =============================================================================
+
+module tc.gfx.yuv;
+
+import "color.tc";
+import "canvas.tc";
+
+// ---------------------------------------------------------------------------
+//  转换表
+// ---------------------------------------------------------------------------
+
+var gYuvTabReady: bool = false;
+var gTy:  [256]i32;
+var gTrv: [256]i32;
+var gTgu: [256]i32;
+var gTgv: [256]i32;
+var gTbu: [256]i32;
+
+fn yuvInitTables() -> void {
+    if gYuvTabReady {
+        return;
+    }
+    var i: i32 = 0;
+    while i < 256 {
+        gTy[i]  = 298 * (i - 16);           // 1.164 * 256
+        gTrv[i] = 409 * (i - 128);          // 1.596 * 256
+        gTgu[i] = (0 - 100) * (i - 128);    // -0.391 * 256
+        gTgv[i] = (0 - 208) * (i - 128);    // -0.813 * 256
+        gTbu[i] = 516 * (i - 128);          // 2.018 * 256
+        i = i + 1;
+    }
+    gYuvTabReady = true;
+}
+
+fn clampU8(v: i32) -> u32 {
+    if v < 0 {
+        return 0;
+    }
+    if v > 255 {
+        return 255;
+    }
+    return v as u32;
+}
+
+/// 单像素 YUV → 0xAARRGGBB（表已初始化；自检与稀疏采样用）
+pub fn yuvPixel(y: i32, u: i32, v: i32) -> u32 {
+    yuvInitTables();
+    let yy: i32 = gTy[y & 255];
+    let r: i32 = (yy + gTrv[v & 255] + 128) >> 8;
+    let g: i32 = (yy + gTgu[u & 255] + gTgv[v & 255] + 128) >> 8;
+    let b: i32 = (yy + gTbu[u & 255] + 128) >> 8;
+    return argb(255, clampU8(r), clampU8(g), clampU8(b));
+}
+
+// ---------------------------------------------------------------------------
+//  整帧转换
+// ---------------------------------------------------------------------------
+
+/// YUV420P 整帧 → BGRA。所有 stride 以**像素**为单位。
+/// 每两个水平像素共享一组 U/V（省掉逐像素除法）。
+/// 内层刻意不做函数调用（钳位与打包全部内联）——实测比调用 clamp/argb 快约 3 倍。
+pub fn yuv420ToBgra(dst: *u32, dstPitch: i32,
+                    ys: *u8, us: *u8, vs: *u8,
+                    width: i32, height: i32,
+                    yStride: i32, uvStride: i32) -> void {
+    yuvInitTables();
+    let alpha: u32 = 0xFF000000 as u32;
+    var row: i32 = 0;
+    while row < height {
+        let ysrc: *u8 = ys + row * yStride;
+        let usrc: *u8 = us + (row / 2) * uvStride;
+        let vsrc: *u8 = vs + (row / 2) * uvStride;
+        let drow: *u32 = dst + row * dstPitch;
+        var cu: i32 = 0;
+        var col: i32 = 0;
+        while col < width {
+            let uu: i32 = usrc[cu] as i32;
+            let vv: i32 = vsrc[cu] as i32;
+            let trv: i32 = gTrv[vv];
+            let tgu: i32 = gTgu[uu];
+            let tgv: i32 = gTgv[vv];
+            let tbu: i32 = gTbu[uu];
+            var k: i32 = 0;
+            while k < 2 && col < width {
+                let yy: i32 = gTy[ysrc[col] as i32];
+                var r: i32 = (yy + trv + 128) >> 8;
+                var g: i32 = (yy + tgu + tgv + 128) >> 8;
+                var b: i32 = (yy + tbu + 128) >> 8;
+                // 钳位到 [0, 255]：编译器将其生成为条件移动（cmov），
+                // 实测比手写无分支位运算快（后者指令数更多，见 ROADMAP 性能记录）
+                if r < 0 { r = 0; }
+                if r > 255 { r = 255; }
+                if g < 0 { g = 0; }
+                if g > 255 { g = 255; }
+                if b < 0 { b = 0; }
+                if b > 255 { b = 255; }
+                drow[col] = alpha | ((r << 16) as u32) | ((g << 8) as u32) | (b as u32);
+                col = col + 1;
+                k = k + 1;
+            }
+            cu = cu + 1;
+        }
+        row = row + 1;
+    }
+}
+
+/// 把 YUV420P 帧缩放到画布矩形 (dx, dy, dw, dh)，最近邻采样。
+/// 播放器 M7.4 起用它将解码帧直接送上屏（免中间缓冲）。
+pub fn yuv420DrawScaled(c: *Canvas,
+                        ys: *u8, us: *u8, vs: *u8,
+                        srcW: i32, srcH: i32, yStride: i32, uvStride: i32,
+                        dx: i32, dy: i32, dw: i32, dh: i32) -> void {
+    if dw <= 0 || dh <= 0 || srcW <= 0 || srcH <= 0 {
+        return;
+    }
+    yuvInitTables();
+    var j: i32 = 0;
+    while j < dh {
+        let oy: i32 = dy + j;
+        if oy >= 0 && oy < c->h {
+            let sy: i32 = j * srcH / dh;
+            let ysrc: *u8 = ys + sy * yStride;
+            let usrc: *u8 = us + (sy / 2) * uvStride;
+            let vsrc: *u8 = vs + (sy / 2) * uvStride;
+            let drow: *u32 = c->px + oy * c->pitch;
+            var i: i32 = 0;
+            while i < dw {
+                let ox: i32 = dx + i;
+                if ox >= 0 && ox < c->w {
+                    let sx: i32 = i * srcW / dw;
+                    let yy: i32 = gTy[ysrc[sx] as i32];
+                    let uu: i32 = usrc[sx / 2] as i32;
+                    let vv: i32 = vsrc[sx / 2] as i32;
+                    let r: i32 = (yy + gTrv[vv] + 128) >> 8;
+                    let g: i32 = (yy + gTgu[uu] + gTgv[vv] + 128) >> 8;
+                    let b: i32 = (yy + gTbu[uu] + 128) >> 8;
+                    drow[ox] = argb(255, clampU8(r), clampU8(g), clampU8(b));
+                }
+                i = i + 1;
+            }
+        }
+        j = j + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  离线自检图案
+// ---------------------------------------------------------------------------
+
+/// 生成测试 YUV420P：上半为灰度阶梯，下半为色带（红/绿/蓝/青/洋红/黄）。
+pub fn yuv420MakeTest(ys: *u8, us: *u8, vs: *u8, w: i32, h: i32,
+                      yStride: i32, uvStride: i32) -> void {
+    var row: i32 = 0;
+    while row < h {
+        var col: i32 = 0;
+        while col < w {
+            if row < h / 2 {
+                // 灰度阶梯：Y 从 16 到 235 分 8 级
+                let lvl: i32 = col * 8 / w;
+                ys[row * yStride + col] = (16 + lvl * 31) as u8;
+            } else {
+                ys[row * yStride + col] = (16 + col * 219 / w) as u8;
+            }
+            col = col + 1;
+        }
+        // 色度：每 2 行写一次（4:2:0）
+        if row % 2 == 0 {
+            var cu: i32 = 0;
+            while cu < w / 2 {
+                var uu: i32 = 128;
+                var vv: i32 = 128;
+                if row >= h / 2 {
+                    let band: i32 = cu * 6 / (w / 2);
+                    if band == 0 { uu = 90;  vv = 240; }        // 红
+                    if band == 1 { uu = 54;  vv = 34;  }        // 绿
+                    if band == 2 { uu = 240; vv = 110; }        // 蓝
+                    if band == 3 { uu = 166; vv = 16;  }        // 青
+                    if band == 4 { uu = 202; vv = 222; }        // 洋红
+                    if band == 5 { uu = 26;  vv = 146; }        // 黄
+                }
+                us[(row / 2) * uvStride + cu] = uu as u8;
+                vs[(row / 2) * uvStride + cu] = vv as u8;
+                cu = cu + 1;
+            }
+        }
+        row = row + 1;
+    }
+}

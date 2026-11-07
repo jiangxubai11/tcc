@@ -1,0 +1,461 @@
+// =============================================================================
+//  tclib/gfx/canvas.tc — 软件光栅器（M7.1：基础图元）
+// -----------------------------------------------------------------------------
+//  画布 = 外部提供的 32bpp BGRA 像素缓冲 + 宽高 + 行跨度。
+//  本文件不分配内存、不持有资源，所有图元写入前一律做矩形裁剪。
+//
+//  M7.1 提供：清屏 / 像素 / 矩形 / 描边 / 水平垂直线 / 画线 / 垂直渐变 /
+//             圆 / 最近邻缩放 blit
+//  M7.2 计划：三角填充、双线性缩放、YUV 采样器、SSE 向量化
+// =============================================================================
+
+module tc.gfx.canvas;
+
+import "color.tc";
+
+pub struct Canvas {
+    px: *u32;      // 像素基址（BGRA）
+    w: i32;
+    h: i32;
+    pitch: i32;    // 每行像素数（u32 个数）
+}
+
+// ---------------------------------------------------------------------------
+//  构造与裁剪
+// ---------------------------------------------------------------------------
+
+pub fn canvasInit(c: *Canvas, px: *u32, w: i32, h: i32, pitch: i32) -> void {
+    c->px = px;
+    c->w = w;
+    c->h = h;
+    c->pitch = pitch;
+}
+
+/// 把画布收缩到子矩形 (x, y, w, h)（越界部分裁掉，基点随之前移）。
+pub fn canvasClip(c: *Canvas, x: i32, y: i32, w: i32, h: i32) -> void {
+    var cx: i32 = x;
+    var cy: i32 = y;
+    var cw: i32 = w;
+    var ch: i32 = h;
+    if cx < 0 { cw = cw + cx; cx = 0; }
+    if cy < 0 { ch = ch + cy; cy = 0; }
+    if cx + cw > c->w { cw = c->w - cx; }
+    if cy + ch > c->h { ch = c->h - cy; }
+    if cw < 0 { cw = 0; }
+    if ch < 0 { ch = 0; }
+    c->px = c->px + (cy * c->pitch + cx);
+    c->w = cw;
+    c->h = ch;
+}
+
+// ---------------------------------------------------------------------------
+//  填充类图元
+// ---------------------------------------------------------------------------
+
+pub fn canvasClear(c: *Canvas, color: u32) -> void {
+    var y: i32 = 0;
+    while y < c->h {
+        let row: *u32 = c->px + y * c->pitch;
+        var x: i32 = 0;
+        while x < c->w {
+            row[x] = color;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+pub fn canvasPixel(c: *Canvas, x: i32, y: i32, color: u32) -> void {
+    if x < 0 || y < 0 || x >= c->w || y >= c->h {
+        return;
+    }
+    c->px[y * c->pitch + x] = color;
+}
+
+/// 带裁剪的实心矩形
+pub fn canvasFillRect(c: *Canvas, x: i32, y: i32, w: i32, h: i32, color: u32) -> void {
+    var cx: i32 = x;
+    var cy: i32 = y;
+    var cw: i32 = w;
+    var ch: i32 = h;
+    if cw <= 0 || ch <= 0 { return; }
+    if cx < 0 { cw = cw + cx; cx = 0; }
+    if cy < 0 { ch = ch + cy; cy = 0; }
+    if cx + cw > c->w { cw = c->w - cx; }
+    if cy + ch > c->h { ch = c->h - cy; }
+    if cw <= 0 || ch <= 0 { return; }
+
+    var j: i32 = 0;
+    while j < ch {
+        let row: *u32 = c->px + (cy + j) * c->pitch;
+        var i: i32 = 0;
+        while i < cw {
+            row[cx + i] = color;
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+}
+
+/// 半透明实心矩形；alpha ∈ [0, 255]
+pub fn canvasFillRectBlend(c: *Canvas, x: i32, y: i32, w: i32, h: i32, color: u32, alpha: u32) -> void {
+    var cx: i32 = x;
+    var cy: i32 = y;
+    var cw: i32 = w;
+    var ch: i32 = h;
+    if cw <= 0 || ch <= 0 { return; }
+    if cx < 0 { cw = cw + cx; cx = 0; }
+    if cy < 0 { ch = ch + cy; cy = 0; }
+    if cx + cw > c->w { cw = c->w - cx; }
+    if cy + ch > c->h { ch = c->h - cy; }
+    if cw <= 0 || ch <= 0 { return; }
+
+    var j: i32 = 0;
+    while j < ch {
+        let row: *u32 = c->px + (cy + j) * c->pitch;
+        var i: i32 = 0;
+        while i < cw {
+            row[cx + i] = blend(row[cx + i], color, alpha);
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+}
+
+/// 矩形描边（向内画 thickness 像素）
+pub fn canvasFrameRect(c: *Canvas, x: i32, y: i32, w: i32, h: i32, color: u32, thickness: i32) -> void {
+    if w <= 0 || h <= 0 || thickness <= 0 { return; }
+    canvasFillRect(c, x, y, w, thickness, color);
+    canvasFillRect(c, x, y + h - thickness, w, thickness, color);
+    canvasFillRect(c, x, y + thickness, thickness, h - thickness * 2, color);
+    canvasFillRect(c, x + w - thickness, y + thickness, thickness, h - thickness * 2, color);
+}
+
+pub fn canvasHLine(c: *Canvas, x: i32, y: i32, len: i32, color: u32) -> void {
+    canvasFillRect(c, x, y, len, 1, color);
+}
+
+pub fn canvasVLine(c: *Canvas, x: i32, y: i32, len: i32, color: u32) -> void {
+    canvasFillRect(c, x, y, 1, len, color);
+}
+
+/// 两点之间画线（Bresenham，全整数；仅在裁剪区内逐像素写入）
+pub fn canvasLine(c: *Canvas, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) -> void {
+    var ax: i32 = x0;
+    var ay: i32 = y0;
+    var dx: i32 = x1 - x0;
+    var dy: i32 = y1 - y0;
+    var sx: i32 = 1;
+    var sy: i32 = 1;
+    if dx < 0 { dx = 0 - dx; sx = 0 - 1; }
+    if dy < 0 { dy = 0 - dy; sy = 0 - 1; }
+    var err: i32 = dx - dy;
+
+    while true {
+        canvasPixel(c, ax, ay, color);
+        if ax == x1 && ay == y1 { break; }
+        let e2: i32 = err * 2;
+        if e2 > (0 - dy) {
+            err = err - dy;
+            ax = ax + sx;
+        }
+        if e2 < dx {
+            err = err + dx;
+            ay = ay + sy;
+        }
+    }
+}
+
+/// 垂直线性渐变（从上色 top 到下色 bottom）
+pub fn canvasVGradient(c: *Canvas, x: i32, y: i32, w: i32, h: i32, top: u32, bottom: u32) -> void {
+    if w <= 0 || h <= 0 { return; }
+    var j: i32 = 0;
+    while j < h {
+        let t: u32 = (j * 256 / h) as u32;
+        canvasFillRect(c, x, y + j, w, 1, lerpColor(top, bottom, t));
+        j = j + 1;
+    }
+}
+
+/// 实心圆（中点圆算法逐行求半宽）
+pub fn canvasFillCircle(c: *Canvas, cx: i32, cy: i32, radius: i32, color: u32) -> void {
+    if radius <= 0 { return; }
+    var dy: i32 = 0 - radius;
+    while dy <= radius {
+        let span: i32 = radius * radius - dy * dy;
+        let half: i32 = isqrt(span);
+        canvasFillRect(c, cx - half, cy + dy, half * 2 + 1, 1, color);
+        dy = dy + 1;
+    }
+}
+
+/// 整数平方根（牛顿迭代；仅用于圆绘制等小规模场合）
+pub fn isqrt(v: i32) -> i32 {
+    if v <= 0 { return 0; }
+    var x: i32 = v;
+    var y: i32 = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    return x;
+}
+
+// ---------------------------------------------------------------------------
+//  位块传送
+// ---------------------------------------------------------------------------
+
+/// 最近邻缩放贴图：把 src 整体缩放到本画布的 (dx, dy, dw, dh) 矩形。
+/// M7.2 将提供双线性版本（canvasBlitBilinear）。
+pub fn canvasBlit(c: *Canvas, src: *Canvas, dx: i32, dy: i32, dw: i32, dh: i32) -> void {
+    if dw <= 0 || dh <= 0 || src->w <= 0 || src->h <= 0 { return; }
+    var j: i32 = 0;
+    while j < dh {
+        let oy: i32 = dy + j;
+        if oy >= 0 && oy < c->h {
+            let sy: i32 = j * src->h / dh;
+            let srow: *u32 = src->px + sy * src->pitch;
+            let drow: *u32 = c->px + oy * c->pitch;
+            var i: i32 = 0;
+            while i < dw {
+                let ox: i32 = dx + i;
+                if ox >= 0 && ox < c->w {
+                    drow[ox] = srow[i * src->w / dw];
+                }
+                i = i + 1;
+            }
+        }
+        j = j + 1;
+    }
+}
+
+/// 同尺寸拷贝（无缩放）
+pub fn canvasCopy(c: *Canvas, src: *Canvas, dx: i32, dy: i32) -> void {
+    canvasBlit(c, src, dx, dy, src->w, src->h);
+}
+
+/// 整块矩形填充测试（性能基准用）
+pub fn canvasBenchFill(c: *Canvas, iter: i32, color: u32) -> void {
+    var k: i32 = 0;
+    while k < iter {
+        canvasFillRect(c, 0, 0, c->w, c->h, color);
+        k = k + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  三角形填充（M7.2）
+// ---------------------------------------------------------------------------
+
+fn maxi(a: i32, b: i32) -> i32 {
+    if a > b { return a; }
+    return b;
+}
+
+fn mini(a: i32, b: i32) -> i32 {
+    if a < b { return a; }
+    return b;
+}
+
+fn min3(a: i32, b: i32, c: i32) -> i32 {
+    return mini(mini(a, b), c);
+}
+
+fn max3(a: i32, b: i32, c: i32) -> i32 {
+    return maxi(maxi(a, b), c);
+}
+
+fn clampCh(v: i64) -> u32 {
+    if v < 0 { return 0; }
+    if v > 255 { return 255; }
+    return v as u32;
+}
+
+/// 边 (xa,ya)→(xb,yb) 的每行 x 增量（16.16 定点）
+fn edgeStep(xa: i32, ya: i32, xb: i32, yb: i32) -> i64 {
+    if yb == ya {
+        return 0;
+    }
+    return ((xb - xa) as i64) * 65536 / ((yb - ya) as i64);
+}
+
+/// 用 16.16 定点端点画一行（自动排序、自动裁剪）
+fn fillSpan16(c: *Canvas, y: i32, xa: i64, xb: i64, color: u32) -> void {
+    if y < 0 || y >= c->h {
+        return;
+    }
+    var lo: i64 = xa;
+    var hi: i64 = xb;
+    if lo > hi {
+        let t: i64 = lo;
+        lo = hi;
+        hi = t;
+    }
+    let xs: i32 = (lo >> 16) as i32;
+    let xe: i32 = (hi >> 16) as i32;
+    if xe < xs {
+        return;
+    }
+    canvasFillRect(c, xs, y, xe - xs + 1, 1, color);
+}
+
+/// 平色三角形（扫描线 + 边定点插值；顶点顺序任意）。
+pub fn canvasTriangle(c: *Canvas,
+                      x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32,
+                      color: u32) -> void {
+    // 按 y 升序排列三个顶点：a ≤ b ≤ c
+    var ax: i32 = x0;  var ay: i32 = y0;
+    var bx: i32 = x1;  var by: i32 = y1;
+    var cx: i32 = x2;  var cy: i32 = y2;
+    if ay > by {
+        let tx: i32 = ax; ax = bx; bx = tx;
+        let ty: i32 = ay; ay = by; by = ty;
+    }
+    if by > cy {
+        let tx2: i32 = bx; bx = cx; cx = tx2;
+        let ty2: i32 = by; by = cy; cy = ty2;
+    }
+    if ay > by {
+        let tx3: i32 = ax; ax = bx; bx = tx3;
+        let ty3: i32 = ay; ay = by; by = ty3;
+    }
+    if ay == cy {
+        return;                       // 退化（零面积）
+    }
+
+    let stepAC: i64 = edgeStep(ax, ay, cx, cy);   // 长边 a→c
+    let stepAB: i64 = edgeStep(ax, ay, bx, by);
+    let stepBC: i64 = edgeStep(bx, by, cx, cy);
+    var xAC: i64 = (ax as i64) << 16;
+    var xAB: i64 = (ax as i64) << 16;
+    var xBC: i64 = (bx as i64) << 16;
+
+    // 上半：a → b（含 a，不含 b）
+    var y: i32 = ay;
+    while y < by {
+        fillSpan16(c, y, xAC, xAB, color);
+        xAC = xAC + stepAC;
+        xAB = xAB + stepAB;
+        y = y + 1;
+    }
+    // 下半：b → c（含 b，含 c）
+    while y <= cy {
+        fillSpan16(c, y, xAC, xBC, color);
+        xAC = xAC + stepAC;
+        xBC = xBC + stepBC;
+        y = y + 1;
+    }
+}
+
+/// 三顶点带色三角形（重心坐标插值；着色器管线的基础图元）。
+pub fn canvasTriangleGouraud(c: *Canvas,
+                             x0: i32, y0: i32, c0: u32,
+                             x1: i32, y1: i32, c1: u32,
+                             x2: i32, y2: i32, c2: u32) -> void {
+    let lx: i32 = maxi(min3(x0, x1, x2), 0);
+    let hx: i32 = mini(max3(x0, x1, x2), c->w - 1);
+    let ly: i32 = maxi(min3(y0, y1, y2), 0);
+    let hy: i32 = mini(max3(y0, y1, y2), c->h - 1);
+    if lx > hx || ly > hy {
+        return;
+    }
+
+    // 2 倍坐标下的面积（叉积），用于重心判定与归一
+    let area: i64 = ((x1 * 2 - x0 * 2) as i64) * ((y2 * 2 - y0 * 2) as i64) -
+                    ((x2 * 2 - x0 * 2) as i64) * ((y1 * 2 - y0 * 2) as i64);
+    if area == 0 {
+        return;
+    }
+
+    var y: i32 = ly;
+    while y <= hy {
+        let py: i32 = y * 2 + 1;
+        var x: i32 = lx;
+        while x <= hx {
+            let px: i32 = x * 2 + 1;
+            let w0: i64 = ((x1 * 2 - px) as i64) * ((y2 * 2 - py) as i64) -
+                          ((x2 * 2 - px) as i64) * ((y1 * 2 - py) as i64);
+            let w1: i64 = ((x2 * 2 - px) as i64) * ((y0 * 2 - py) as i64) -
+                          ((x0 * 2 - px) as i64) * ((y2 * 2 - py) as i64);
+            let w2: i64 = ((x0 * 2 - px) as i64) * ((y1 * 2 - py) as i64) -
+                          ((x1 * 2 - px) as i64) * ((y0 * 2 - py) as i64);
+            var inside: bool = false;
+            if w0 >= 0 && w1 >= 0 && w2 >= 0 { inside = true; }
+            if w0 <= 0 && w1 <= 0 && w2 <= 0 { inside = true; }
+            if inside {
+                let sw: i64 = w0 + w1 + w2;
+                if sw != 0 {
+                    let r: i64 = ((colR(c0) as i64) * w0 + (colR(c1) as i64) * w1 +
+                                  (colR(c2) as i64) * w2) / sw;
+                    let g: i64 = ((colG(c0) as i64) * w0 + (colG(c1) as i64) * w1 +
+                                  (colG(c2) as i64) * w2) / sw;
+                    let b: i64 = ((colB(c0) as i64) * w0 + (colB(c1) as i64) * w1 +
+                                  (colB(c2) as i64) * w2) / sw;
+                    c->px[y * c->pitch + x] = argb(255, clampCh(r), clampCh(g), clampCh(b));
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  双线性缩放（M7.2）
+// ---------------------------------------------------------------------------
+
+/// 16.16 权重两色插值（w ∈ [0, 65535]）
+fn lerp16(a: u32, b: u32, w: i32) -> u32 {
+    let iw: u32 = (65536 - w) as u32;
+    let wu: u32 = w as u32;
+    let r: u32 = (colR(a) * iw + colR(b) * wu) >> 16;
+    let g: u32 = (colG(a) * iw + colG(b) * wu) >> 16;
+    let bl: u32 = (colB(a) * iw + colB(b) * wu) >> 16;
+    return argb(255, r, g, bl);
+}
+
+/// 双线性四邻域插值
+fn bilerp4(p00: u32, p10: u32, p01: u32, p11: u32, wx: i32, wy: i32) -> u32 {
+    return lerp16(lerp16(p00, p10, wx), lerp16(p01, p11, wx), wy);
+}
+
+/// 双线性缩放贴图：把 src 整体缩放到本画布的 (dx, dy, dw, dh) 矩形。
+/// 采样坐标为像素中心对齐的 16.16 定点；边缘像素自动钳位。
+pub fn canvasBlitBilinear(c: *Canvas, src: *Canvas, dx: i32, dy: i32, dw: i32, dh: i32) -> void {
+    if dw <= 0 || dh <= 0 || src->w <= 0 || src->h <= 0 {
+        return;
+    }
+    let sw: i32 = src->w;
+    let sh: i32 = src->h;
+    var j: i32 = 0;
+    while j < dh {
+        let oy: i32 = dy + j;
+        if oy >= 0 && oy < c->h {
+            // fy = (j + 0.5) * sh / dh - 0.5（16.16）
+            let fy: i64 = ((j as i64) * 2 + 1) * (sh as i64) * 32768 / (dh as i64) - 32768;
+            var y0: i32 = (fy >> 16) as i32;
+            var wy: i32 = ((fy as u64) & 65535) as i32;
+            if fy < 0 { y0 = 0; wy = 0; }
+            var y1: i32 = y0 + 1;
+            if y1 > sh - 1 { y1 = sh - 1; }
+            let r0: *u32 = src->px + y0 * src->pitch;
+            let r1: *u32 = src->px + y1 * src->pitch;
+            let drow: *u32 = c->px + oy * c->pitch;
+            var i: i32 = 0;
+            while i < dw {
+                let ox: i32 = dx + i;
+                if ox >= 0 && ox < c->w {
+                    let fx: i64 = ((i as i64) * 2 + 1) * (sw as i64) * 32768 / (dw as i64) - 32768;
+                    var x0: i32 = (fx >> 16) as i32;
+                    var wx: i32 = ((fx as u64) & 65535) as i32;
+                    if fx < 0 { x0 = 0; wx = 0; }
+                    var x1: i32 = x0 + 1;
+                    if x1 > sw - 1 { x1 = sw - 1; }
+                    drow[ox] = bilerp4(r0[x0], r0[x1], r1[x0], r1[x1], wx, wy);
+                }
+                i = i + 1;
+            }
+        }
+        j = j + 1;
+    }
+}

@@ -1,0 +1,1238 @@
+// =============================================================================
+//  examples/mail/tcmail.tc — TC 邮件发送器（QQ 邮箱 / SMTP over SSL）
+// -----------------------------------------------------------------------------
+//  GUI：窗口 + 5 个输入框 + 1 个发送按钮 + 1 个状态文本
+//  底层：WinSock2（ws2_32.dll）+ SChannel TLS（secur32.dll）+ base64 + SMTP
+//
+//  QQ 邮箱：smtp.qq.com:465（SMTPS，连接即 TLS）
+//  认证：AUTH LOGIN + base64(邮箱) / base64(授权码)
+//
+//  ---- 为什么不用 import "ws2_32.dll"; extern fn ----
+//  本项目编译器当前的 `import "xxx.dll"` 不生成 PE 导入表（
+//  tests\t_import.tc 的产物只有 .text 一个节，实测调用无效）。
+//  因此统一走项目纪律：运行时解析导出函数。
+//  做法比 wiwin32.tc 的 ensureModule 更简单 —— 用 kernel32 的
+//  LoadLibraryA / GetProcAddress，操作系统会自动处理「转发导出」
+//  （secur32 的多数函数其实是转发到 sspicli.dll 的）。
+//
+//  构建：build\tcc3.exe examples\mail\tcmail.tc -o examples\mail\tcmail.exe
+// =============================================================================
+
+module tcmail
+
+import "tcrt/rt.tc"
+import "tclib/win/win32.tc"
+
+// -----------------------------------------------------------------------------
+//  常量
+// -----------------------------------------------------------------------------
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+
+// SChannel 返回码
+const TLS_OK: i32 = 0;
+const TLS_CONTINUE: i32 = 0x00090312;   // SEC_I_CONTINUE_NEEDED
+const TLS_INCOMPLETE: i32 = 0x80090318; // SEC_E_INCOMPLETE_MESSAGE
+
+// SChannel 结构常量
+const SECBUFFER_VERSION: u32 = 0;
+const SECBUFFER_EMPTY: u32 = 0;
+const SECBUFFER_DATA: u32 = 1;
+const SECBUFFER_TOKEN: u32 = 2;
+const SECBUFFER_EXTRA: u32 = 5;
+const SECBUFFER_STREAM_HEADER: u32 = 7;
+const SECBUFFER_STREAM_TRAILER: u32 = 6;
+
+// ISC_REQ：ALLOC_MEM|CONFIDENTIALITY|REPLAY|SEQ|STREAM|USE_SUPPLIED_CREDS
+const ISC_REQ_FLAGS: u32 = 0x0000819C;
+const SECPKG_ATTR_STREAM_SIZES: u32 = 4;
+
+// 控件 id
+const ID_发件: u64 = 1001;
+const ID_授权码: u64 = 1002;
+const ID_收件: u64 = 1003;
+const ID_主题: u64 = 1004;
+const ID_正文: u64 = 1005;
+const ID_发送: u64 = 1006;
+const ID_状态: u64 = 1007;
+
+// Edit 控件样式（win32.tc 未提供 ES_*，此处自带）
+const ES_PASSWORD: u32 = 0x0020;
+const ES_MULTILINE: u32 = 0x0004;
+const ES_AUTOVSCROLL: u32 = 0x0040;
+const ES_AUTOHSCROLL: u32 = 0x0080;
+
+// -----------------------------------------------------------------------------
+//  运行时解析出来的 API 地址
+// -----------------------------------------------------------------------------
+
+var gLoadLib: u64 = 0;      // kernel32!LoadLibraryA
+var gGetProc: u64 = 0;      // kernel32!GetProcAddress
+
+// WinSock2
+var gWSAStartup: u64 = 0;
+var gSocket: u64 = 0;
+var gConnect: u64 = 0;
+var gSend: u64 = 0;
+var gRecv: u64 = 0;
+var gClosesocket: u64 = 0;
+var gGetHostByName: u64 = 0;
+
+// SChannel
+var gAcquireCred: u64 = 0;
+var gInitSecCtx: u64 = 0;
+var gQueryCtxAttr: u64 = 0;
+var gEncryptMsg: u64 = 0;
+var gDecryptMsg: u64 = 0;
+var gFreeCtxBuf: u64 = 0;
+
+// -----------------------------------------------------------------------------
+//  全局状态
+// -----------------------------------------------------------------------------
+
+var gHwnd: u64 = 0;
+var gEd发件: u64 = 0;
+var gEd授权码: u64 = 0;
+var gEd收件: u64 = 0;
+var gEd主题: u64 = 0;
+var gEd正文: u64 = 0;
+var gSt状态: u64 = 0;
+
+// 诊断日志：每次点发送都重建 build\mail.log，逐步骤写入。
+// 崩溃时窗口来不及提示，但已写出的行会留在磁盘上，据此可精确判断死在哪一步。
+var gLogF: File;
+var gLogOk: bool = false;
+
+var gSock: u64 = 0;
+var gTlsReady: bool = false;
+var gCred: [32]u8;
+var gCtxt: [32]u8;
+var gHasCred: bool = false;
+var gHasCtxt: bool = false;
+var gStreamSizes: [32]u8;
+
+var gRecvBuf: *u8 = null;
+var gRecvLen: u64 = 0;
+var gRecvPos: u64 = 0;
+var gRawBuf: *u8 = null;
+var gRawLen: u64 = 0;
+var gLineBuf: *u8 = null;
+var gSendBuf: *u8 = null;
+
+// -----------------------------------------------------------------------------
+//  字符串工具
+// -----------------------------------------------------------------------------
+
+fn 串长(s: *u8) -> u64 {
+    var n: u64 = 0;
+    while s[n] != 0 {
+        n = n + 1;
+    }
+    return n;
+}
+
+fn 复制串(dst: *u8, src: *u8) -> void {
+    var i: u64 = 0;
+    while src[i] != 0 {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[i] = 0;
+}
+
+fn 拼接串(dst: *u8, src: *u8) -> void {
+    var i: u64 = 串长(dst);
+    var j: u64 = 0;
+    while src[j] != 0 {
+        dst[i] = src[j];
+        i = i + 1;
+        j = j + 1;
+    }
+    dst[i] = 0;
+}
+
+fn 追加字节(dst: *u8, pos: *u64, b: u8) -> void {
+    dst[*pos] = b;
+    *pos = *pos + 1;
+    dst[*pos] = 0;
+}
+
+// -----------------------------------------------------------------------------
+//  运行时 API 解析
+// -----------------------------------------------------------------------------
+
+fn 取内核函数(name: *u8) -> u64 {
+    let k32: *u8 = findModule("kernel32.dll");
+    if (k32 as u64) == 0 {
+        return 0;
+    }
+    return findExport(k32, name) as u64;
+}
+
+/// 加载 DLL 并解析若干导出。名字用固定小缓冲传递，避免把字符串字面量当地址用。
+fn 加载并解析(dll: *u8) -> u64 {
+    if gLoadLib == 0 || gGetProc == 0 {
+        gLoadLib = 取内核函数("LoadLibraryA");
+        gGetProc = 取内核函数("GetProcAddress");
+    }
+    if gLoadLib == 0 || gGetProc == 0 {
+        return 0;
+    }
+    var nb: [128]u8;
+    复制串(&nb[0], dll);
+    let h: u64 = 调用1(gLoadLib, &nb[0] as u64);
+    return h;
+}
+
+fn 取导出(hmod: u64, name: *u8) -> u64 {
+    if hmod == 0 || gGetProc == 0 {
+        return 0;
+    }
+    var nb: [64]u8;
+    复制串(&nb[0], name);
+    return 调用2(gGetProc, hmod, &nb[0] as u64);
+}
+
+// ---- 按地址调用（x64 WinAPI 与 C 调用约定一致）----
+
+fn 调用1(f: u64, a1: u64) -> u64 {
+    let fp: fn(u64) -> u64 = f as fn(u64) -> u64;
+    return fp(a1);
+}
+
+fn 调用2(f: u64, a1: u64, a2: u64) -> u64 {
+    let fp: fn(u64, u64) -> u64 = f as fn(u64, u64) -> u64;
+    return fp(a1, a2);
+}
+
+fn 调用3(f: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let fp: fn(u64, u64, u64) -> u64 = f as fn(u64, u64, u64) -> u64;
+    return fp(a1, a2, a3);
+}
+
+fn 调用4(f: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64) -> u64 = f as fn(u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4);
+}
+
+fn 调用9(f: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+         a6: u64, a7: u64, a8: u64, a9: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+        f as fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4, a5, a6, a7, a8, a9);
+}
+
+fn 调用12(f: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64,
+          a7: u64, a8: u64, a9: u64, a10: u64, a11: u64, a12: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+        f as fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
+}
+
+fn 绑定网络API() -> bool {
+    let h: u64 = 加载并解析("ws2_32.dll");
+    if h == 0 {
+        return false;
+    }
+    gWSAStartup = 取导出(h, "WSAStartup");
+    gSocket = 取导出(h, "socket");
+    gConnect = 取导出(h, "connect");
+    gSend = 取导出(h, "send");
+    gRecv = 取导出(h, "recv");
+    gClosesocket = 取导出(h, "closesocket");
+    gGetHostByName = 取导出(h, "gethostbyname");
+    if gWSAStartup == 0 || gSocket == 0 || gConnect == 0 || gSend == 0 ||
+       gRecv == 0 || gClosesocket == 0 || gGetHostByName == 0 {
+        return false;
+    }
+    return true;
+}
+
+fn 绑定TLSAPI() -> bool {
+    let h: u64 = 加载并解析("secur32.dll");
+    if h == 0 {
+        return false;
+    }
+    gAcquireCred = 取导出(h, "AcquireCredentialsHandleW");
+    gInitSecCtx = 取导出(h, "InitializeSecurityContextW");
+    gQueryCtxAttr = 取导出(h, "QueryContextAttributesW");
+    gEncryptMsg = 取导出(h, "EncryptMessage");
+    gDecryptMsg = 取导出(h, "DecryptMessage");
+    gFreeCtxBuf = 取导出(h, "FreeContextBuffer");
+    if gAcquireCred == 0 || gInitSecCtx == 0 || gQueryCtxAttr == 0 ||
+       gEncryptMsg == 0 || gDecryptMsg == 0 {
+        return false;
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+//  base64 编码（SMTP AUTH LOGIN 需要）
+// -----------------------------------------------------------------------------
+
+fn b64字符(v: u32) -> u8 {
+    if v < 26 {
+        return (65 + v) as u8;
+    }
+    if v < 52 {
+        return (97 + v - 26) as u8;
+    }
+    if v < 62 {
+        return (48 + v - 52) as u8;
+    }
+    if v == 62 {
+        return 43;
+    }
+    return 47;
+}
+
+fn base64编码(src: *u8, n: u64, dst: *u8, cap: u64) -> u64 {
+    var out: u64 = 0;
+    var i: u64 = 0;
+    while i + 3 <= n {
+        if out + 8 >= cap {
+            dst[out] = 0;
+            return out;
+        }
+        let b0: u32 = src[i] as u32;
+        let b1: u32 = src[i + 1] as u32;
+        let b2: u32 = src[i + 2] as u32;
+        let v: u32 = (b0 << 16) | (b1 << 8) | b2;
+        dst[out] = b64字符((v >> 18) & 63);
+        dst[out + 1] = b64字符((v >> 12) & 63);
+        dst[out + 2] = b64字符((v >> 6) & 63);
+        dst[out + 3] = b64字符(v & 63);
+        out = out + 4;
+        i = i + 3;
+    }
+    let rem: u64 = n - i;
+    if rem == 1 {
+        let v: u32 = (src[i] as u32) << 16;
+        dst[out] = b64字符((v >> 18) & 63);
+        dst[out + 1] = b64字符((v >> 12) & 63);
+        dst[out + 2] = 61;
+        dst[out + 3] = 61;
+        out = out + 4;
+    } else if rem == 2 {
+        let v: u32 = ((src[i] as u32) << 16) | ((src[i + 1] as u32) << 8);
+        dst[out] = b64字符((v >> 18) & 63);
+        dst[out + 1] = b64字符((v >> 12) & 63);
+        dst[out + 2] = b64字符((v >> 6) & 63);
+        dst[out + 3] = 61;
+        out = out + 4;
+    }
+    dst[out] = 0;
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+//  小端读写
+// -----------------------------------------------------------------------------
+
+fn 读u32(buf: *u8, off: u64) -> u32 {
+    var v: u32 = buf[off] as u32;
+    v = v | ((buf[off + 1] as u32) << 8);
+    v = v | ((buf[off + 2] as u32) << 16);
+    v = v | ((buf[off + 3] as u32) << 24);
+    return v;
+}
+
+fn 写u32(buf: *u8, off: u64, v: u32) -> void {
+    buf[off] = (v & 0xFF) as u8;
+    buf[off + 1] = ((v >> 8) & 0xFF) as u8;
+    buf[off + 2] = ((v >> 16) & 0xFF) as u8;
+    buf[off + 3] = ((v >> 24) & 0xFF) as u8;
+}
+
+fn 写ptr(buf: *u8, off: u64, v: u64) -> void {
+    buf[off] = (v & 0xFF) as u8;
+    buf[off + 1] = ((v >> 8) & 0xFF) as u8;
+    buf[off + 2] = ((v >> 16) & 0xFF) as u8;
+    buf[off + 3] = ((v >> 24) & 0xFF) as u8;
+    buf[off + 4] = ((v >> 32) & 0xFF) as u8;
+    buf[off + 5] = ((v >> 40) & 0xFF) as u8;
+    buf[off + 6] = ((v >> 48) & 0xFF) as u8;
+    buf[off + 7] = ((v >> 56) & 0xFF) as u8;
+}
+
+fn 读ptr(buf: *u8, off: u64) -> u64 {
+    var v: u64 = 0;
+    var q: u64 = 0;
+    while q < 8 {
+        v = v | ((buf[off + q] as u64) << (q * 8));
+        q = q + 1;
+    }
+    return v;
+}
+
+// -----------------------------------------------------------------------------
+//  TCP 层
+// -----------------------------------------------------------------------------
+
+fn 网络初始化() -> bool {
+    var wsa: [512]u8;
+    let r: i32 = 调用2(gWSAStartup, 0x0202, &wsa[0] as u64) as i32;
+    return r == 0;
+}
+
+fn 域名解析(host: *u8, ip4: *u8) -> bool {
+    let he: u64 = 调用1(gGetHostByName, host as u64);
+    if he == 0 {
+        return false;
+    }
+    // HOSTENT（x64）：h_name@0 h_aliases@8 h_addrtype@16 h_length@18 h_addr_list@24
+    let list: u64 = *((he + 24) as *u64);
+    if list == 0 {
+        return false;
+    }
+    let addr: u64 = *(list as *u64);
+    if addr == 0 {
+        return false;
+    }
+    ip4[0] = (addr as *u8)[0];
+    ip4[1] = (addr as *u8)[1];
+    ip4[2] = (addr as *u8)[2];
+    ip4[3] = (addr as *u8)[3];
+    return true;
+}
+
+fn 建立连接(host: *u8, port: i32) -> bool {
+    var ip4: [4]u8;
+    if !域名解析(host, &ip4[0]) {
+        return false;
+    }
+    let s: u64 = 调用3(gSocket, AF_INET as u64, SOCK_STREAM as u64, 0);
+    if s == 0 || s == 0xFFFFFFFFFFFFFFFF {
+        return false;
+    }
+    var sa: [16]u8;
+    sa[0] = 2;
+    sa[1] = 0;
+    sa[2] = ((port >> 8) & 0xFF) as u8;
+    sa[3] = (port & 0xFF) as u8;
+    sa[4] = ip4[0];
+    sa[5] = ip4[1];
+    sa[6] = ip4[2];
+    sa[7] = ip4[3];
+    var k: u64 = 8;
+    while k < 16 {
+        sa[k] = 0;
+        k = k + 1;
+    }
+    let r: i32 = 调用3(gConnect, s, &sa[0] as u64, 16) as i32;
+    if r != 0 {
+        调用1(gClosesocket, s);
+        return false;
+    }
+    gSock = s;
+    return true;
+}
+
+fn 关闭连接() -> void {
+    if gSock != 0 {
+        调用1(gClosesocket, gSock);
+        gSock = 0;
+    }
+}
+
+fn 原始发送(buf: *u8, len: u64) -> bool {
+    var sent: u64 = 0;
+    while sent < len {
+        let n: i32 = 调用4(gSend, gSock, (buf + sent) as u64, (len - sent) as u64, 0) as i32;
+        if n <= 0 {
+            return false;
+        }
+        sent = sent + (n as u64);
+    }
+    return true;
+}
+
+fn 原始接收(buf: *u8, cap: u64) -> i64 {
+    let n: i32 = 调用4(gRecv, gSock, buf as u64, cap, 0) as i32;
+    return n as i64;
+}
+
+// -----------------------------------------------------------------------------
+//  TLS 层（SChannel）
+// -----------------------------------------------------------------------------
+
+fn TLS初始化() -> bool {
+    var pkg: [128]u16;
+    let pn: u64 = utf8ToU16("Microsoft Unified Security Protocol Provider", &pkg[0], 128);
+
+    // SCHANNEL_CRED（80 字节）
+    var cred: [80]u8;
+    var i: u64 = 0;
+    while i < 80 {
+        cred[i] = 0;
+        i = i + 1;
+    }
+    cred[0] = 4;    // dwVersion = SCHANNEL_CRED_VERSION
+    cred[72] = 0x10; // dwFlags = SCH_CRED_NO_DEFAULT_CREDS（证书链交给系统校验）
+
+    var exp: [16]u8;
+    let st: i32 = 调用9(gAcquireCred, 0, &pkg[0] as u64, 2, 0, &cred[0] as u64,
+                        0, 0, &gCred[0] as u64, &exp[0] as u64) as i32;
+    if st < 0 {
+        return false;
+    }
+    gHasCred = true;
+    return true;
+}
+
+/// 把 SecBuffer 表铺成 desc；返回 desc 地址（desc 由调用方给缓冲）
+fn 铺Desc(desc: *u8, bufArr: *u8, 数: u32) -> void {
+    写u32(desc, 0, SECBUFFER_VERSION);
+    写u32(desc, 4, 数);
+    写ptr(desc, 8, bufArr as u64);
+}
+
+fn TLS握手(host: *u8) -> bool {
+    var target: [128]u16;
+    utf8ToU16(host, &target[0], 128);
+
+    var attrs: u32 = 0;
+    var exp: [16]u8;
+    var sb: [32]u8;     // 2 个 SecBuffer
+    var sd: [16]u8;
+
+    // 第一轮：无输入 token
+    写u32(&sb[0], 0, 0);
+    写u32(&sb[0], 4, SECBUFFER_TOKEN);
+    写ptr(&sb[0], 8, 0);
+    铺Desc(&sd[0], &sb[0], 1);
+    写ptr(&sd[0], 8, &sb[0] as u64);
+
+    var st: i32 = 调用12(gInitSecCtx, &gCred[0] as u64, 0, &target[0] as u64,
+                         ISC_REQ_FLAGS as u64, 0, 0x10, 0, 0, &gCtxt[0] as u64,
+                         &sd[0] as u64, &attrs as u64, &exp[0] as u64) as i32;
+    if st != TLS_CONTINUE && st != TLS_OK {
+        return false;
+    }
+    gHasCtxt = true;
+
+    var 轮: i32 = 0;
+    while 轮 < 8 {
+        let cb: u64 = 读u32(&sb[0], 0) as u64;
+        let pv: u64 = 读ptr(&sb[0], 8);
+        if cb > 0 && pv != 0 {
+            if !原始发送(pv as *u8, cb) {
+                return false;
+            }
+            if gFreeCtxBuf != 0 {
+                调用1(gFreeCtxBuf, pv);
+            }
+        }
+        if st == TLS_OK {
+            return true;
+        }
+
+        let inBuf: *u8 = rtAlloc(65536, 16);
+        if (inBuf as u64) == 0 {
+            return false;
+        }
+        let got: i64 = 原始接收(inBuf, 65536);
+        if got <= 0 {
+            return false;
+        }
+
+        var ib: [16]u8;
+        var id: [16]u8;
+        写u32(&ib[0], 0, got as u32);
+        写u32(&ib[0], 4, SECBUFFER_TOKEN);
+        写ptr(&ib[0], 8, inBuf as u64);
+        铺Desc(&id[0], &ib[0], 1);
+        写ptr(&id[0], 8, &ib[0] as u64);
+
+        写u32(&sb[0], 0, 0);
+        写u32(&sb[0], 4, SECBUFFER_TOKEN);
+        写ptr(&sb[0], 8, 0);
+        铺Desc(&sd[0], &sb[0], 1);
+        写ptr(&sd[0], 8, &sb[0] as u64);
+
+        st = 调用12(gInitSecCtx, &gCred[0] as u64, &gCtxt[0] as u64, &target[0] as u64,
+                    ISC_REQ_FLAGS as u64, 0, 0x10, &id[0] as u64, 0,
+                    &gCtxt[0] as u64, &sd[0] as u64, &attrs as u64, &exp[0] as u64) as i32;
+        if st != TLS_CONTINUE && st != TLS_OK {
+            return false;
+        }
+        轮 = 轮 + 1;
+    }
+    return st == TLS_OK;
+}
+
+fn TLS取流参数() -> bool {
+    let r: i32 = 调用3(gQueryCtxAttr, &gCtxt[0] as u64, SECPKG_ATTR_STREAM_SIZES as u64,
+                       &gStreamSizes[0] as u64) as i32;
+    return r >= 0;
+}
+
+fn TLS发送(data: *u8, len: u64) -> bool {
+    let cbHdr: u64 = 读u32(&gStreamSizes[0], 0) as u64;
+    let cbTrail: u64 = 读u32(&gStreamSizes[0], 4) as u64;
+    let cbMax: u64 = 读u32(&gStreamSizes[0], 8) as u64;
+    if cbMax == 0 {
+        return false;
+    }
+
+    var sent: u64 = 0;
+    while sent < len {
+        var chunk: u64 = len - sent;
+        if chunk > cbMax {
+            chunk = cbMax;
+        }
+        let total: u64 = cbHdr + chunk + cbTrail;
+        let buf: *u8 = rtAlloc(total + 64, 16);
+        if (buf as u64) == 0 {
+            return false;
+        }
+        var sa: [48]u8;
+        var sd: [16]u8;
+
+        var i: u64 = 0;
+        while i < chunk {
+            buf[cbHdr + i] = data[sent + i];
+            i = i + 1;
+        }
+
+        写u32(&sa[0], 0, cbHdr as u32);
+        写u32(&sa[0], 4, SECBUFFER_STREAM_HEADER);
+        写ptr(&sa[0], 8, buf as u64);
+
+        写u32(&sa[16], 0, chunk as u32);
+        写u32(&sa[16], 4, SECBUFFER_DATA);
+        写ptr(&sa[16], 8, (buf + cbHdr) as u64);
+
+        写u32(&sa[32], 0, cbTrail as u32);
+        写u32(&sa[32], 4, SECBUFFER_STREAM_TRAILER);
+        写ptr(&sa[32], 8, (buf + cbHdr + chunk) as u64);
+
+        铺Desc(&sd[0], &sa[0], 3);
+        写ptr(&sd[0], 8, &sa[0] as u64);
+
+        let r: i32 = 调用4(gEncryptMsg, &gCtxt[0] as u64, 0, &sd[0] as u64, 0) as i32;
+        if r < 0 {
+            return false;
+        }
+        if !原始发送(buf, total) {
+            return false;
+        }
+        sent = sent + chunk;
+    }
+    return true;
+}
+
+/// 确保接收缓冲里有数据。TLS 下必须处理两种情况：
+///   1) 记录没收全 → SEC_E_INCOMPLETE_MESSAGE，要再读；
+///   2) 一次收到多条记录 → 多余字节以 SECBUFFER_EXTRA 返回，留到下次。
+fn 补数据() -> bool {
+    if gRecvPos < gRecvLen {
+        return true;
+    }
+    gRecvLen = 0;
+    gRecvPos = 0;
+    var 尝试: i32 = 0;
+    while 尝试 < 8 {
+        if gRawLen > 0 {
+            var sa: [64]u8;
+            var sd: [16]u8;
+            写u32(&sa[0], 0, gRawLen as u32);
+            写u32(&sa[0], 4, SECBUFFER_DATA);
+            写ptr(&sa[0], 8, gRawBuf as u64);
+            写u32(&sa[16], 0, 0);
+            写u32(&sa[16], 4, SECBUFFER_EMPTY);
+            写ptr(&sa[16], 8, 0);
+            写u32(&sa[32], 0, 0);
+            写u32(&sa[32], 4, SECBUFFER_EMPTY);
+            写ptr(&sa[32], 8, 0);
+            写u32(&sa[48], 0, 0);
+            写u32(&sa[48], 4, SECBUFFER_EMPTY);
+            写ptr(&sa[48], 8, 0);
+            铺Desc(&sd[0], &sa[0], 4);
+            写ptr(&sd[0], 8, &sa[0] as u64);
+
+            let r: i32 = 调用4(gDecryptMsg, &gCtxt[0] as u64, &sd[0] as u64, 0, 0) as i32;
+            if r == TLS_OK {
+                var 多余: u64 = 0;
+                var 多余源: u64 = 0;
+                var k: u64 = 0;
+                while k < 4 {
+                    let bt: u32 = 读u32(&sa[0], k * 16 + 4);
+                    let cb: u64 = 读u32(&sa[0], k * 16) as u64;
+                    let pv: u64 = 读ptr(&sa[0], k * 16 + 8);
+                    if bt == SECBUFFER_DATA {
+                        var i: u64 = 0;
+                        while i < cb {
+                            gRecvBuf[i] = (pv as *u8)[i];
+                            i = i + 1;
+                        }
+                        gRecvLen = cb;
+                        gRecvPos = 0;
+                    } else if bt == SECBUFFER_EXTRA {
+                        多余 = cb;
+                        多余源 = pv;
+                    }
+                    k = k + 1;
+                }
+                if 多余 > 0 && 多余源 != 0 {
+                    var i2: u64 = 0;
+                    while i2 < 多余 {
+                        gRawBuf[i2] = (多余源 as *u8)[i2];
+                        i2 = i2 + 1;
+                    }
+                    gRawLen = 多余;
+                } else {
+                    gRawLen = 0;
+                }
+                return gRecvLen > 0;
+            }
+            if r != TLS_INCOMPLETE {
+                return false;
+            }
+        }
+        let got: i64 = 原始接收(gRawBuf + gRawLen, 65536 - gRawLen);
+        if got <= 0 {
+            return false;
+        }
+        gRawLen = gRawLen + (got as u64);
+        尝试 = 尝试 + 1;
+    }
+    return false;
+}
+
+/// TLS 读一行（到 LF 为止，去掉 CR/LF 不写入 dst）
+fn TLS读行(dst: *u8, cap: u64) -> u64 {
+    var out: u64 = 0;
+    while out + 1 < cap {
+        if !补数据() {
+            dst[out] = 0;
+            return out;
+        }
+        let b: u8 = gRecvBuf[gRecvPos];
+        gRecvPos = gRecvPos + 1;
+        if b == 10 {
+            dst[out] = 0;
+            return out;
+        }
+        if b != 13 {
+            dst[out] = b;
+            out = out + 1;
+        }
+    }
+    dst[out] = 0;
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+//  SMTP 协议
+// -----------------------------------------------------------------------------
+
+fn SMTP读状态(dst: *u8, cap: u64) -> i32 {
+    let n: u64 = TLS读行(dst, cap);
+    if n < 3 {
+        return 0;
+    }
+    var code: i32 = 0;
+    code = ((dst[0] as i32) - 48) * 100;
+    code = code + ((dst[1] as i32) - 48) * 10;
+    code = code + ((dst[2] as i32) - 48);
+    // 多行响应：第 4 个字符是 '-' 时继续读，直到第 4 个字符是空格
+    if n >= 4 && dst[3] == 45 {
+        var 循环: i32 = 0;
+        while 循环 < 128 {
+            let m: u64 = TLS读行(dst, cap);
+            if m < 4 {
+                return code;
+            }
+            if dst[3] == 32 {
+                return code;
+            }
+            循环 = 循环 + 1;
+        }
+    }
+    return code;
+}
+
+fn SMTP命令(cmd: *u8) -> bool {
+    let n: u64 = 串长(cmd);
+    var i: u64 = 0;
+    while i < n {
+        gSendBuf[i] = cmd[i];
+        i = i + 1;
+    }
+    gSendBuf[n] = 13;
+    gSendBuf[n + 1] = 10;
+    return TLS发送(gSendBuf, n + 2);
+}
+
+fn SMTP执行(cmd: *u8) -> i32 {
+    if !SMTP命令(cmd) {
+        return 0;
+    }
+    return SMTP读状态(gLineBuf, 4096);
+}
+
+// -----------------------------------------------------------------------------
+//  发送流程
+// -----------------------------------------------------------------------------
+
+fn 设置状态(s: *u8) -> void {
+    if gSt状态 != 0 {
+        winSetCtlText(gSt状态, s);
+        // 必须直接刷新状态控件本身：UpdateWindow(主窗口) 不会重画子控件，
+        // 而消息循环此刻正被本次点击阻塞，STATIC 收不到重绘 —— 表现就是「界面卡死」。
+        wcall1(gWin.updateWindow, gSt状态);
+    }
+    if gHwnd != 0 {
+        wcall1(gWin.updateWindow, gHwnd);
+    }
+}
+
+/// 同时写窗口状态与落盘日志
+fn 日志(s: *u8) -> void {
+    if gLogOk {
+        rtFileWrite(&gLogF, s, 串长(s));
+    }
+    设置状态(s);
+}
+
+/// 「前缀 + 十进制状态码」，用于把 SMTP 返回码记进日志
+fn 记码(前缀: *u8, 码: i32) -> void {
+    var b: [128]u8;
+    复制串(&b[0], 前缀);
+    var n: u64 = 串长(&b[0]);
+    var v: i32 = 码;
+    if v < 0 {
+        b[n] = 45;
+        n = n + 1;
+        v = 0 - v;
+    }
+    var d: [12]u8;
+    var dn: u64 = 0;
+    if v == 0 {
+        d[0] = 48;
+        dn = 1;
+    } else {
+        while v > 0 {
+            d[dn] = (48 + (v % 10)) as u8;
+            dn = dn + 1;
+            v = v / 10;
+        }
+    }
+    while dn > 0 {
+        dn = dn - 1;
+        b[n] = d[dn];
+        n = n + 1;
+    }
+    b[n] = 0;
+    设置状态(&b[0]);
+    if gLogOk {
+        b[n] = 10;
+        rtFileWrite(&gLogF, &b[0], n + 1);
+        b[n] = 0;
+    }
+}
+
+/// 正文按 SMTP 规则：行首的点要去重（".."）
+fn 正文点转义(src: *u8, pos: *u64) -> void {
+    var i: u64 = 0;
+    var 行首: bool = true;
+    while src[i] != 0 {
+        if 行首 && src[i] == 46 {
+            追加字节(gSendBuf, pos, 46);
+        }
+        追加字节(gSendBuf, pos, src[i]);
+        if src[i] == 10 {
+            行首 = true;
+        } else {
+            行首 = false;
+        }
+        i = i + 1;
+    }
+}
+
+/// 返回 0 = 成功；1 = 连接失败；2 = TLS 失败；3 = 认证失败；4 = 发送失败
+fn 发送邮件(发件: *u8, 授权码: *u8, 收件: *u8, 主题: *u8, 正文: *u8) -> i32 {
+    gRecvLen = 0;
+    gRecvPos = 0;
+    gRawLen = 0;
+    gTlsReady = false;
+
+    日志("步1 WSAStartup\n");
+    if !网络初始化() {
+        日志("失败 WSAStartup\n");
+        return 1;
+    }
+    日志("步2 解析域名 + 连接 465\n");
+    if !建立连接("smtp.qq.com", 465) {
+        日志("失败 connect\n");
+        return 1;
+    }
+    日志("步3 申请 TLS 凭据\n");
+    if !TLS初始化() {
+        日志("失败 AcquireCredentialsHandle\n");
+        关闭连接();
+        return 2;
+    }
+    日志("步4 TLS 握手\n");
+    if !TLS握手("smtp.qq.com") {
+        日志("失败 TLS 握手\n");
+        关闭连接();
+        return 2;
+    }
+    日志("步5 取流参数\n");
+    if !TLS取流参数() {
+        日志("失败 QueryContextAttributes\n");
+        关闭连接();
+        return 2;
+    }
+    gTlsReady = true;
+
+    日志("步6 读 220 问候\n");
+    if SMTP读状态(gLineBuf, 4096) != 220 {
+        日志("失败 问候不是 220\n");
+        关闭连接();
+        return 1;
+    }
+    日志("步7 EHLO\n");
+    if SMTP执行("EHLO tcmail") != 250 {
+        日志("失败 EHLO\n");
+        关闭连接();
+        return 2;
+    }
+
+    日志("步8 AUTH LOGIN\n");
+    if SMTP执行("AUTH LOGIN") != 334 {
+        日志("失败 AUTH LOGIN\n");
+        关闭连接();
+        return 3;
+    }
+    let b64: *u8 = rtAlloc(8192, 16);
+    if (b64 as u64) == 0 {
+        关闭连接();
+        return 4;
+    }
+    日志("步9 送发件邮箱(base64)\n");
+    base64编码(发件, 串长(发件), b64, 8192);
+    if SMTP执行(b64) != 334 {
+        日志("失败 邮箱被拒\n");
+        关闭连接();
+        return 3;
+    }
+    日志("步10 送授权码(base64)\n");
+    base64编码(授权码, 串长(授权码), b64, 8192);
+    if SMTP执行(b64) != 235 {
+        日志("失败 授权码被拒\n");
+        关闭连接();
+        return 3;
+    }
+
+    let cmd: *u8 = rtAlloc(2048, 16);
+    if (cmd as u64) == 0 {
+        关闭连接();
+        return 4;
+    }
+    cmd[0] = 0;
+    拼接串(cmd, "MAIL FROM:<");
+    拼接串(cmd, 发件);
+    拼接串(cmd, ">");
+    日志("步11 MAIL FROM\n");
+    let c2: i32 = SMTP执行(cmd);
+    if c2 != 250 {
+        记码("失败 MAIL FROM 返回 ", c2);
+        关闭连接();
+        return 4;
+    }
+    cmd[0] = 0;
+    拼接串(cmd, "RCPT TO:<");
+    拼接串(cmd, 收件);
+    拼接串(cmd, ">");
+    日志("步12 RCPT TO\n");
+    let c3: i32 = SMTP执行(cmd);
+    if c3 != 250 && c3 != 251 {
+        记码("失败 RCPT TO 返回 ", c3);
+        关闭连接();
+        return 4;
+    }
+    日志("步13 DATA\n");
+    let c4: i32 = SMTP执行("DATA");
+    if c4 != 354 {
+        记码("失败 DATA 返回 ", c4);
+        关闭连接();
+        return 4;
+    }
+
+    gSendBuf[0] = 0;
+    拼接串(gSendBuf, "From: <");
+    拼接串(gSendBuf, 发件);
+    拼接串(gSendBuf, ">\r\nTo: <");
+    拼接串(gSendBuf, 收件);
+    拼接串(gSendBuf, ">\r\nSubject: ");
+    拼接串(gSendBuf, 主题);
+    拼接串(gSendBuf, "\r\nMIME-Version: 1.0\r\n");
+    拼接串(gSendBuf, "Content-Type: text/plain; charset=UTF-8\r\n");
+    拼接串(gSendBuf, "Content-Transfer-Encoding: 8bit\r\n\r\n");
+    var pos: u64 = 串长(gSendBuf);
+    正文点转义(正文, &pos);
+    追加字节(gSendBuf, &pos, 13);
+    追加字节(gSendBuf, &pos, 10);
+    追加字节(gSendBuf, &pos, 46);   // 结束标记 "."
+    追加字节(gSendBuf, &pos, 13);
+    追加字节(gSendBuf, &pos, 10);
+
+    日志("步14 发送正文\n");
+    if !TLS发送(gSendBuf, pos) {
+        日志("失败 正文加密/发送\n");
+        关闭连接();
+        return 4;
+    }
+    日志("步15 等 250 确认\n");
+    let c5: i32 = SMTP读状态(gLineBuf, 4096);
+    if c5 != 250 {
+        记码("失败 正文被拒 返回 ", c5);
+        关闭连接();
+        return 4;
+    }
+    日志("步16 QUIT\n");
+    SMTP命令("QUIT");
+    关闭连接();
+    日志("完成\n");
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+//  GUI
+// -----------------------------------------------------------------------------
+
+fn 取控件文本(hwnd: u64, dst: *u8, cap: u64) -> u64 {
+    dst[0] = 0;
+    if hwnd == 0 {
+        return 0;
+    }
+    let 码元: u64 = wcall4(gWin.sendMessageW, hwnd, 0x000E, 0, 0);
+    if 码元 == 0 {
+        return 0;
+    }
+    let need: u64 = 码元 * 2 + 16;
+    let wbuf: *u8 = rtAlloc(need, 16);
+    if (wbuf as u64) == 0 {
+        return 0;
+    }
+    // SendMessageW(h, Msg, wParam, lParam)：WM_GETTEXT 的 wParam 是「最大字符数」，
+    // lParam 才是缓冲区指针。写反会把一个小整数当指针，Windows 直接访问冲突、
+    // 进程无提示退出 —— 这正是「点发送后卡一下然后整个程序消失」的原因。
+    wcall4(gWin.sendMessageW, hwnd, 0x000D, 码元 + 1, wbuf as u64);
+    let n: u64 = u16ToUtf8(wbuf as *u16, dst, cap);
+    return n;
+}
+
+fn 点发送() -> void {
+    let 发件: *u8 = rtAlloc(512, 16);
+    let 授权码: *u8 = rtAlloc(512, 16);
+    let 收件: *u8 = rtAlloc(512, 16);
+    let 主题: *u8 = rtAlloc(1024, 16);
+    let 正文: *u8 = rtAlloc(16384, 16);
+    if (发件 as u64) == 0 || (授权码 as u64) == 0 || (收件 as u64) == 0 ||
+       (主题 as u64) == 0 || (正文 as u64) == 0 {
+        设置状态("内存不足");
+        return;
+    }
+    取控件文本(gEd发件, 发件, 512);
+    取控件文本(gEd授权码, 授权码, 512);
+    取控件文本(gEd收件, 收件, 512);
+    取控件文本(gEd主题, 主题, 1024);
+    取控件文本(gEd正文, 正文, 16384);
+
+    if 串长(发件) == 0 {
+        设置状态("请填写发件邮箱");
+        return;
+    }
+    if 串长(授权码) == 0 {
+        设置状态("请填写授权码（QQ 邮箱设置里生成，不是登录密码）");
+        return;
+    }
+    if 串长(收件) == 0 {
+        设置状态("请填写收件邮箱");
+        return;
+    }
+
+    // 每次点击都重建诊断日志：崩溃时窗口来不及提示，但已写出的行会留在磁盘上
+    var lp: [128]u8;
+    复制串(&lp[0], "build\\mail.log");
+    gLogF = rtFileCreate(&lp[0]);
+    gLogOk = gLogF.ok;
+
+    日志("开始发送\n");
+    let r: i32 = 发送邮件(发件, 授权码, 收件, 主题, 正文);
+    if r == 0 {
+        设置状态("发送成功：邮件已投递给 SMTP 服务器");
+    } else if r == 1 {
+        设置状态("连接失败：无法连接 smtp.qq.com:465，请检查网络");
+    } else if r == 2 {
+        设置状态("TLS 失败：无法建立加密通道（系统 TLS 不可用？）");
+    } else if r == 3 {
+        设置状态("认证失败：邮箱或授权码错误（授权码需在 QQ 邮箱设置中生成）");
+    } else {
+        设置状态("发送失败：服务器拒绝了发信请求");
+    }
+}
+
+/// 无界面网络自检：只做「连接 + TLS 握手 + 读问候」，全部写日志。
+/// 触发条件：存在 build\probe.txt（用于无人值守环境定位网络层故障）。
+fn 网络自检() -> void {
+    var lp: [128]u8;
+    复制串(&lp[0], "build\\mail.log");
+    gLogF = rtFileCreate(&lp[0]);
+    gLogOk = gLogF.ok;
+    gRecvLen = 0;
+    gRecvPos = 0;
+    gRawLen = 0;
+
+    日志("自检1 WSAStartup\n");
+    if !网络初始化() {
+        日志("自检失败 WSAStartup\n");
+        return;
+    }
+    日志("自检2 connect 465\n");
+    if !建立连接("smtp.qq.com", 465) {
+        日志("自检失败 connect\n");
+        return;
+    }
+    日志("自检3 申请凭据\n");
+    if !TLS初始化() {
+        日志("自检失败 凭据\n");
+        关闭连接();
+        return;
+    }
+    日志("自检4 握手\n");
+    if !TLS握手("smtp.qq.com") {
+        日志("自检失败 握手\n");
+        关闭连接();
+        return;
+    }
+    日志("自检5 流参数\n");
+    if !TLS取流参数() {
+        日志("自检失败 流参数\n");
+        关闭连接();
+        return;
+    }
+    日志("自检6 读问候\n");
+    let c: i32 = SMTP读状态(gLineBuf, 4096);
+    记码("自检 问候码 ", c);
+    记码(" 流参数 头长 ", 读u32(&gStreamSizes[0], 0) as i32);
+    记码(" 流参数 尾长 ", 读u32(&gStreamSizes[0], 4) as i32);
+    记码(" 流参数 最大消息 ", 读u32(&gStreamSizes[0], 8) as i32);
+    日志("自检7 EHLO\n");
+    let e: i32 = SMTP执行("EHLO tcmail");
+    记码("自检 EHLO 码 ", e);
+    日志("自检8 AUTH LOGIN\n");
+    let a: i32 = SMTP执行("AUTH LOGIN");
+    记码("自检 AUTH 码 ", a);
+    // 自检10：正文转义压力测试（20000 字节、每行以点开头的最坏情况）
+    // 目的：确认 正文点转义 不会写穿 gSendBuf（65536）。
+    let big: *u8 = rtAlloc(20000, 16);
+    if (big as u64) != 0 {
+        var bi: u64 = 0;
+        while bi < 19998 {
+            big[bi] = 46;
+            bi = bi + 1;
+            big[bi] = 10;
+            bi = bi + 1;
+        }
+        big[19998] = 0;
+        gSendBuf[0] = 0;
+        var pos: u64 = 0;
+        正文点转义(big, &pos);
+        记码("自检 转义后长度 ", pos as i32);
+    }
+
+    日志("自检9 QUIT\n");
+    SMTP命令("QUIT");
+    关闭连接();
+    日志("自检结束\n");
+}
+
+fn 窗口过程(h: u64, msg: u32, wp: u64, lp: i64) -> i64 {
+    if msg == 0x0010 {          // WM_CLOSE
+        wcall1(gWin.postQuitMessage, 0);
+        return 0;
+    }
+    if msg == 0x0002 {          // WM_DESTROY
+        wcall1(gWin.postQuitMessage, 0);
+        return 0;
+    }
+    if msg == 0x0111 {          // WM_COMMAND
+        let ctl: u64 = wp & 0xFFFF;
+        if ctl == ID_发送 {
+            点发送();
+        }
+        return 0;
+    }
+    return wcall4(gWin.defWindowProcW, h, msg as u64, wp, lp as u64) as i64;
+}
+
+fn 建输入框(父: u64, 标签id: u64, 标签: *u8, 输入id: u64, y: i32, 高: i32, 样式: u32) -> u64 {
+    let lb: u64 = winControl(父, 标签id, "STATIC", 标签, 16, y + 6, 100, 22, 0);
+    winSetFont(lb);
+    let ed: u64 = winControl(父, 输入id, "EDIT", "", 124, y, 560, 高, 样式);
+    winSetFont(ed);
+    return ed;
+}
+
+fn main() -> i32 {
+    if !rtInit() {
+        return 1;
+    }
+    if !winInit() {
+        return 2;
+    }
+
+    gRecvBuf = rtAlloc(65536, 16);
+    gRawBuf = rtAlloc(65536, 16);
+    gLineBuf = rtAlloc(4096, 16);
+    gSendBuf = rtAlloc(65536, 16);
+    if (gRecvBuf as u64) == 0 || (gRawBuf as u64) == 0 ||
+       (gLineBuf as u64) == 0 || (gSendBuf as u64) == 0 {
+        winMsgBox(0, "内存不足，无法分配收发缓冲。", "TC 邮件发送器", 0x10);
+        return 3;
+    }
+
+    if !绑定网络API() {
+        winMsgBox(0, "无法解析 ws2_32.dll 的导出函数。", "TC 邮件发送器", 0x10);
+        return 6;
+    }
+
+    if !绑定TLSAPI() {
+        winMsgBox(0, "无法解析 secur32.dll 的导出函数。", "TC 邮件发送器", 0x10);
+        return 7;
+    }
+
+    if !winRegisterClassEx("TCMailWnd", 窗口过程, 0, 0x00FFFFFF) {
+        winMsgBox(0, "注册窗口类失败。", "TC 邮件发送器", 0x10);
+        return 4;
+    }
+    gHwnd = winCreateWindowFramed("TCMailWnd", "TC 邮件发送器（QQ 邮箱 / SMTP over SSL）", 720, 560);
+    if gHwnd == 0 {
+        winMsgBox(0, "创建窗口失败。", "TC 邮件发送器", 0x10);
+        return 5;
+    }
+
+    gEd发件 = 建输入框(gHwnd, 2001, "发件邮箱:", ID_发件, 16, 26, ES_AUTOHSCROLL);
+    gEd授权码 = 建输入框(gHwnd, 2002, "授权码:", ID_授权码, 54, 26,
+                         ES_AUTOHSCROLL | ES_PASSWORD);
+    gEd收件 = 建输入框(gHwnd, 2003, "收件邮箱:", ID_收件, 92, 26, ES_AUTOHSCROLL);
+    gEd主题 = 建输入框(gHwnd, 2004, "邮件主题:", ID_主题, 130, 26, ES_AUTOHSCROLL);
+    gEd正文 = 建输入框(gHwnd, 2005, "邮件正文:", ID_正文, 168, 260,
+                       ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL);
+
+    let btn: u64 = winControl(gHwnd, ID_发送, "BUTTON", "发送邮件", 124, 446, 200, 40,
+                              BS_PUSHBUTTON);
+    winSetFont(btn);
+
+    gSt状态 = winControl(gHwnd, ID_状态, "STATIC", "就绪", 124, 496, 560, 24, 0);
+    winSetFont(gSt状态);
+
+    winShow(gHwnd, SW_SHOW);
+    return winRun();
+}

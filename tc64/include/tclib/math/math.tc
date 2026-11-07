@@ -1,0 +1,90 @@
+// =============================================================================
+//  tclib/math/math.tc — 数学函数
+// -----------------------------------------------------------------------------
+//  基础版本：整数的绝对值 / 最值，浮点的绝对值 / 最值 / 平方根。
+//  sqrt 直接映射到 SSE sqrtsd 内建，为 IEEE-754 正确舍入。
+//  指数 / 对数 / 三角（exp / log / sin / cos）后续以多项式近似补齐。
+// =============================================================================
+
+module tc.math;
+
+// ---- 整数 ----
+
+pub fn i64Abs(x: i64) -> i64 {
+    if x < 0 {
+        return -x;
+    }
+    return x;
+}
+
+pub fn i64Min(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+pub fn i64Max(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+pub fn u64Min(a: u64, b: u64) -> u64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+pub fn u64Max(a: u64, b: u64) -> u64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+/// 把 v 夹在 [lo, hi] 之间
+pub fn i64Clamp(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    return v;
+}
+
+// ---- 浮点 ----
+
+pub fn f64Abs(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x;
+    }
+    return x;
+}
+
+pub fn f64Min(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+pub fn f64Max(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+/// 平方根（SSE sqrtsd，IEEE-754 正确舍入）
+pub fn f64Sqrt(x: f64) -> f64 {
+    return sqrt(x);
+}
+
+/// 平方
+pub fn f64Sq(x: f64) -> f64 {
+    return x * x;
+}

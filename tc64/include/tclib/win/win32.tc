@@ -1,0 +1,1067 @@
+// =============================================================================
+//  tclib/win/win32.tc — Win32 GUI 基础库（user32 / gdi32 / advapi32 / kernel32）
+// -----------------------------------------------------------------------------
+//  项目纪律：不静态导入任何 DLL（产物导入表恒为空）。
+//  与 tcrt/sys/nt.tc 同一套做法：PEB → 加载器链表 → 找到目标 DLL →
+//  内存中解析导出表 → 得到函数地址，全部经函数指针调用。
+//
+//  x64 上 WinAPI 与 C 调用约定一致（RCX/RDX/R8/R9 + 栈），且 TC 生成代码
+//  不触碰非易失寄存器（RBX/RSI/RDI/R12-R15），因此 TC 函数可直接作为
+//  WNDPROC 回调被 Windows 调用。
+// =============================================================================
+
+module win.win32;
+
+import "../../tcrt/sys/nt.tc";
+import "../../tcrt/core/mem.tc";
+import "../../tcrt/core/io.tc";
+
+// ---------------------------------------------------------------------------
+//  消息
+// ---------------------------------------------------------------------------
+
+pub const WM_CREATE:  u32 = 0x0001;
+pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_PAINT:   u32 = 0x000F;
+pub const WM_CLOSE:   u32 = 0x0010;
+pub const WM_COMMAND: u32 = 0x0111;
+pub const WM_TIMER:   u32 = 0x0113;
+pub const WM_SETFONT: u32 = 0x0030;
+pub const BM_GETCHECK: u32 = 0x00F0;
+pub const BN_CLICKED: u64 = 0;
+
+// 播放器所需消息（M7.1）
+pub const WM_QUIT:        u32 = 0x0012;
+pub const WM_SIZE:        u32 = 0x0005;
+pub const WM_ERASEBKGND:  u32 = 0x0014;
+pub const WM_KEYDOWN:     u32 = 0x0100;
+pub const WM_KEYUP:       u32 = 0x0101;
+pub const WM_MOUSEMOVE:   u32 = 0x0200;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_LBUTTONUP:   u32 = 0x0202;
+pub const WM_MOUSEWHEEL:  u32 = 0x020A;
+pub const WM_DROPFILES:   u32 = 0x0233;
+
+// ---------------------------------------------------------------------------
+//  样式与绘制常量
+// ---------------------------------------------------------------------------
+
+pub const WS_CAPTION:     u32 = 0x00C00000;
+pub const WS_SYSMENU:     u32 = 0x00080000;
+pub const WS_MINIMIZEBOX: u32 = 0x00020000;
+pub const WS_CHILD:       u32 = 0x40000000;
+pub const WS_VISIBLE:     u32 = 0x10000000;
+pub const WS_TABSTOP:     u32 = 0x00010000;
+pub const BS_PUSHBUTTON:  u32 = 0x00000000;
+pub const BS_AUTOCHECKBOX: u32 = 0x00000003;
+
+pub const SW_SHOW: i32 = 5;
+pub const SW_HIDE: i32 = 0;
+
+// 可缩放顶层窗口样式（M7.1）
+pub const WS_THICKFRAME:   u32 = 0x00040000;
+pub const WS_MAXIMIZEBOX:  u32 = 0x00010000;
+pub const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
+pub const CS_HREDRAW: u32 = 0x0002;
+pub const CS_VREDRAW: u32 = 0x0001;
+
+// 呈现（GDI 位图 / DIB）
+pub const DIB_RGB_COLORS: u32 = 0;
+pub const BI_RGB:         u32 = 0;
+pub const SRCCOPY:        u32 = 0x00CC0020;
+pub const COLORONCOLOR:   i32 = 3;
+pub const HALFTONE:       i32 = 4;
+pub const PM_REMOVE:      u32 = 0x0001;
+
+// 虚拟键
+pub const VK_ESCAPE: u64 = 0x1B;
+pub const VK_SPACE:  u64 = 0x20;
+pub const VK_LEFT:   u64 = 0x25;
+pub const VK_UP:     u64 = 0x26;
+pub const VK_RIGHT:  u64 = 0x27;
+pub const VK_DOWN:   u64 = 0x28;
+
+pub const DT_LEFT:      u32 = 0x00000000;
+pub const DT_CENTER:    u32 = 0x00000001;
+pub const DT_VCENTER:   u32 = 0x00000004;
+pub const DT_WORDBREAK: u32 = 0x00000010;
+pub const DT_SINGLELINE: u32 = 0x00000020;
+
+pub const TRANSPARENT: i32 = 1;
+pub const DEFAULT_GUI_FONT: u64 = 17;
+pub const IDC_ARROW: u64 = 32512;
+pub const CW_USEDEFAULT: u64 = 0x80000000;
+
+pub const MB_OK: u32 = 0;
+pub const MB_YESNO: u32 = 4;
+pub const MB_ICONERROR: u32 = 0x10;
+pub const MB_ICONQUESTION: u32 = 0x20;
+pub const MB_ICONINFORMATION: u32 = 0x40;
+pub const IDYES: u64 = 6;
+
+// ---------------------------------------------------------------------------
+//  Win32 结构体（x64 布局；对齐由编译器按字段宽度自动处理）
+// ---------------------------------------------------------------------------
+
+pub struct Rect {
+    left: i32;
+    top: i32;
+    right: i32;
+    bottom: i32;
+}
+
+pub struct WinMsg {
+    hwnd: u64;      // +0
+    message: u32;   // +8
+    wParam: u64;    // +16
+    lParam: i64;    // +24
+    time: u32;      // +32
+    ptX: i32;       // +36
+    ptY: i32;       // +40
+}                   // size 48
+
+pub struct PaintStruct {
+    hdc: u64;          // +0
+    fErase: i32;       // +8
+    left: i32;         // +12    rcPaint
+    top: i32;          // +16
+    right: i32;        // +20
+    bottom: i32;       // +24
+    fRestore: i32;     // +28
+    fIncUpdate: i32;   // +32
+    reserved: [32]u8;  // +36
+}                      // size 72
+
+/// BITMAPINFOHEADER 的 x64 内存布局（40 字节），后随 4 字节调色板占位。
+/// 实现用「44 字节缓冲 + u32 下标」写入（见 makeBi），不依赖嵌套成员访问：
+///   [0] biSize(40) | [1] biWidth | [2] biHeight（负 = top-down） |
+///   [3] planes | bitCount<<16 | [4] biCompression(BI_RGB) | [5] biSizeImage |
+///   [6] biXPels | [7] biYPels | [8] biClrUsed | [9] biClrImportant
+pub const BITMAPINFO_BYTES: u64 = 44;
+
+pub struct WndClassEx {
+    cbSize: u32;          // +0
+    style: u32;           // +4
+    lpfnWndProc: u64;     // +8
+    cbClsExtra: i32;      // +16
+    cbWndExtra: i32;      // +20
+    hInstance: u64;       // +24
+    hIcon: u64;           // +32
+    hCursor: u64;         // +40
+    hbrBackground: u64;   // +48
+    lpszMenuName: u64;    // +56
+    lpszClassName: u64;   // +64
+    hIconSm: u64;         // +72
+}                          // size 80
+
+// ---- 音频（winmm）----
+pub const WAVE_FORMAT_PCM: u32 = 1;
+pub const WAVE_MAPPER: u32 = 0xFFFFFFFF;
+pub const CALLBACK_WINDOW: u32 = 0x10000;
+pub const MM_WOM_DONE: u32 = 0x3BD;
+pub const MM_WOM_OPEN: u32 = 0x3BB;
+pub const WHDR_DONE: u32 = 0x00000001;
+pub const WHDR_PREPARED: u32 = 0x00000002;
+
+/// WAVEFORMATEX（x64，size 18）
+pub struct WaveFormatEx {
+    wFormatTag: u16;        // +0
+    nChannels: u16;         // +2
+    nSamplesPerSec: u32;    // +4
+    nAvgBytesPerSec: u32;   // +8
+    nBlockAlign: u16;       // +12
+    wBitsPerSample: u16;    // +14
+    cbSize: u16;            // +16
+}
+
+/// WAVEHDR（x64，size 48）
+pub struct WaveHdr {
+    lpData: u64;            // +0
+    dwBufferLength: u32;    // +8
+    dwBytesRecorded: u32;   // +12
+    dwUser: u64;            // +16
+    dwFlags: u32;           // +24
+    dwLoops: u32;           // +28
+    lpNext: u64;            // +32
+    reserved: u64;          // +40
+}
+
+// ---------------------------------------------------------------------------
+//  函数地址表（rtInit 后由 winInit 填充，此后全程只读）
+// ---------------------------------------------------------------------------
+
+pub struct WinApi {
+    registerClassExW: u64;
+    createWindowExW: u64;
+    defWindowProcW: u64;
+    showWindow: u64;
+    updateWindow: u64;
+    getMessageW: u64;
+    translateMessage: u64;
+    dispatchMessageW: u64;
+    postQuitMessage: u64;
+    destroyWindow: u64;
+    sendMessageW: u64;
+    setWindowTextW: u64;
+    setTimer: u64;
+    killTimer: u64;
+    beginPaint: u64;
+    endPaint: u64;
+    invalidateRect: u64;
+    messageBoxW: u64;
+    loadCursorW: u64;
+    createSolidBrush: u64;
+    deleteObject: u64;
+    fillRect: u64;
+    frameRect: u64;
+    setTextColor: u64;
+    setBkMode: u64;
+    selectObject: u64;
+    getStockObject: u64;
+    drawTextW: u64;
+    createFontW: u64;
+    regCreateKeyW: u64;
+    regSetValueExW: u64;
+    regOpenKeyExW: u64;
+    regQueryValueExW: u64;
+    regDeleteTreeW: u64;
+    regCloseKey: u64;
+    deleteFileW: u64;
+    removeDirectoryW: u64;
+    getLastError: u64;
+    // ---- M7.1 播放器扩展：呈现 / 计时 / 输入 ----
+    getClientRect: u64;
+    getDC: u64;
+    releaseDC: u64;
+    peekMessageW: u64;
+    postMessageW: u64;
+    getAsyncKeyState: u64;
+    adjustWindowRect: u64;
+    createDIBSection: u64;
+    createCompatibleDC: u64;
+    deleteDC: u64;
+    bitBlt: u64;
+    stretchDIBits: u64;
+    setStretchBltMode: u64;
+    queryPerformanceCounter: u64;
+    queryPerformanceFrequency: u64;
+    sleep: u64;
+    // ---- M7 UI：文件拖放（shell32） ----
+    dragAcceptFiles: u64;
+    dragQueryFileW: u64;
+    dragFinish: u64;
+    // ---- M8 音频（winmm）----
+    waveOutOpen: u64;
+    waveOutClose: u64;
+    waveOutWrite: u64;
+    waveOutPrepareHeader: u64;
+    waveOutUnprepareHeader: u64;
+    waveOutReset: u64;
+}
+
+pub var gWin: WinApi;
+
+// ---------------------------------------------------------------------------
+//  解析
+// ---------------------------------------------------------------------------
+
+/// 解析转发导出：export 表项指向 "目标模块.函数名" 字符串（非代码地址）。
+/// 判定依据：x64 代码段函数地址至少 16 字节对齐，未对齐者视为转发器。
+fn resolveForward(spec: *u8) -> u64 {
+    var dllName: [64]u8;
+    var fnName: [128]u8;
+    var i: u64 = 0;
+    while spec[i] != 0 && spec[i] != 46 && i < 63 {
+        dllName[i] = spec[i];
+        i = i + 1;
+    }
+    dllName[i] = 0;
+    if spec[i] != 46 {
+        return 0;
+    }
+    i = i + 1;
+    var j: u64 = 0;
+    while spec[i] != 0 && j < 127 {
+        fnName[j] = spec[i];
+        j = j + 1;
+        i = i + 1;
+    }
+    fnName[j] = 0;
+
+    // 追加 ".dll"
+    var k: u64 = 0;
+    while dllName[k] != 0 {
+        k = k + 1;
+    }
+    dllName[k]     = 46;    // '.'
+    dllName[k + 1] = 100;   // 'd'
+    dllName[k + 2] = 108;   // 'l'
+    dllName[k + 3] = 108;   // 'l'
+    dllName[k + 4] = 0;
+
+    let b: *u8 = ensureModule(&dllName[0]);
+    if (b as u64) == 0 {
+        return 0;
+    }
+    let p2: *u8 = findExport(b, &fnName[0]);
+    if (p2 as u64) == 0 {
+        return 0;
+    }
+    if ((p2 as u64) & 0xF) != 0 {
+        return 0;               // 二级转发不再处理
+    }
+    return p2 as u64;
+}
+
+fn resolveIn(base: *u8, name: *u8) -> u64 {
+    if (base as u64) == 0 {
+        return 0;
+    }
+    let p: *u8 = findExport(base, name);
+    if (p as u64) == 0 {
+        return 0;
+    }
+    if ((p as u64) & 0xF) != 0 {
+        return resolveForward(p);
+    }
+    return p as u64;
+}
+
+/// 确保模块已加载：已在加载器链表中则直接返回基址；
+/// 否则经 ntdll!LdrLoadDll 主动加载 —— 零导入表的进程启动时只加载 ntdll，
+/// user32 / gdi32 / advapi32 都需要这一步。
+fn ensureModule(name: *u8) -> *u8 {
+    var b: *u8 = findModule(name);
+    if (b as u64) != 0 {
+        return b;
+    }
+    let ldrBase: *u8 = findModule("ntdll.dll");
+    if (ldrBase as u64) == 0 {
+        return null;
+    }
+    let loadFn: u64 = findExport(ldrBase, "LdrLoadDll") as u64;
+    if loadFn == 0 {
+        return null;
+    }
+    var n16: [64]u16;
+    let cn: u64 = utf8ToU16(name, &n16[0], 64);
+    var us: UnicodeString;
+    us.len = (cn * 2) as u16;
+    us.maxLen = ((cn + 1) * 2) as u16;
+    us.pad = 0;
+    us.buffer = &n16[0];
+    var h: u64 = 0;
+    let st: u64 = wcall4(loadFn, 0, 0, &us as u64, &h as u64);
+    if (st as i32) < 0 {
+        return null;
+    }
+    return h as *u8;
+}
+
+/// 解析全部所需函数地址。rtInit() 之后调用。
+pub fn winInit() -> bool {
+    let u32b: *u8 = ensureModule("user32.dll");
+    let g32b: *u8 = ensureModule("gdi32.dll");
+    let a32b: *u8 = ensureModule("advapi32.dll");
+    let k32b: *u8 = ensureModule("kernel32.dll");
+    if (u32b as u64) == 0 || (g32b as u64) == 0 {
+        return false;
+    }
+
+    gWin.registerClassExW  = resolveIn(u32b, "RegisterClassExW");
+    gWin.createWindowExW   = resolveIn(u32b, "CreateWindowExW");
+    gWin.defWindowProcW    = resolveIn(u32b, "DefWindowProcW");
+    gWin.showWindow        = resolveIn(u32b, "ShowWindow");
+    gWin.updateWindow      = resolveIn(u32b, "UpdateWindow");
+    gWin.getMessageW       = resolveIn(u32b, "GetMessageW");
+    gWin.translateMessage  = resolveIn(u32b, "TranslateMessage");
+    gWin.dispatchMessageW  = resolveIn(u32b, "DispatchMessageW");
+    gWin.postQuitMessage   = resolveIn(u32b, "PostQuitMessage");
+    gWin.destroyWindow     = resolveIn(u32b, "DestroyWindow");
+    gWin.sendMessageW      = resolveIn(u32b, "SendMessageW");
+    gWin.setWindowTextW    = resolveIn(u32b, "SetWindowTextW");
+    gWin.setTimer          = resolveIn(u32b, "SetTimer");
+    gWin.killTimer         = resolveIn(u32b, "KillTimer");
+    gWin.beginPaint        = resolveIn(u32b, "BeginPaint");
+    gWin.endPaint          = resolveIn(u32b, "EndPaint");
+    gWin.invalidateRect    = resolveIn(u32b, "InvalidateRect");
+    gWin.messageBoxW       = resolveIn(u32b, "MessageBoxW");
+    gWin.loadCursorW       = resolveIn(u32b, "LoadCursorW");
+
+    gWin.createSolidBrush  = resolveIn(g32b, "CreateSolidBrush");
+    gWin.deleteObject      = resolveIn(g32b, "DeleteObject");
+    gWin.fillRect          = resolveIn(u32b, "FillRect");
+    gWin.frameRect         = resolveIn(u32b, "FrameRect");
+    gWin.setTextColor      = resolveIn(g32b, "SetTextColor");
+    gWin.setBkMode         = resolveIn(g32b, "SetBkMode");
+    gWin.selectObject      = resolveIn(g32b, "SelectObject");
+    gWin.getStockObject    = resolveIn(g32b, "GetStockObject");
+    gWin.drawTextW         = resolveIn(u32b, "DrawTextW");
+    gWin.createFontW       = resolveIn(g32b, "CreateFontW");
+
+    gWin.regCreateKeyW     = resolveIn(a32b, "RegCreateKeyW");
+    gWin.regSetValueExW    = resolveIn(a32b, "RegSetValueExW");
+    gWin.regOpenKeyExW     = resolveIn(a32b, "RegOpenKeyExW");
+    gWin.regQueryValueExW  = resolveIn(a32b, "RegQueryValueExW");
+    gWin.regDeleteTreeW    = resolveIn(a32b, "RegDeleteTreeW");
+    gWin.regCloseKey       = resolveIn(a32b, "RegCloseKey");
+
+    gWin.deleteFileW       = resolveIn(k32b, "DeleteFileW");
+    gWin.removeDirectoryW  = resolveIn(k32b, "RemoveDirectoryW");
+    gWin.getLastError      = resolveIn(k32b, "GetLastError");
+
+    // ---- M7.1 播放器扩展 ----
+    gWin.getClientRect      = resolveIn(u32b, "GetClientRect");
+    gWin.getDC              = resolveIn(u32b, "GetDC");
+    gWin.releaseDC          = resolveIn(u32b, "ReleaseDC");
+    gWin.peekMessageW       = resolveIn(u32b, "PeekMessageW");
+    gWin.postMessageW       = resolveIn(u32b, "PostMessageW");
+    gWin.getAsyncKeyState   = resolveIn(u32b, "GetAsyncKeyState");
+    gWin.adjustWindowRect   = resolveIn(u32b, "AdjustWindowRect");
+    gWin.createDIBSection   = resolveIn(g32b, "CreateDIBSection");
+    gWin.createCompatibleDC = resolveIn(g32b, "CreateCompatibleDC");
+    gWin.deleteDC           = resolveIn(g32b, "DeleteDC");
+    gWin.bitBlt             = resolveIn(g32b, "BitBlt");
+    gWin.stretchDIBits      = resolveIn(g32b, "StretchDIBits");
+    gWin.setStretchBltMode  = resolveIn(g32b, "SetStretchBltMode");
+    gWin.queryPerformanceCounter   = resolveIn(k32b, "QueryPerformanceCounter");
+    gWin.queryPerformanceFrequency = resolveIn(k32b, "QueryPerformanceFrequency");
+    gWin.sleep              = resolveIn(k32b, "Sleep");
+
+    // ---- M7 UI：文件拖放（shell32，按需加载）----
+    let s32b: *u8 = ensureModule("shell32.dll");
+    gWin.dragAcceptFiles = resolveIn(s32b, "DragAcceptFiles");
+    gWin.dragQueryFileW  = resolveIn(s32b, "DragQueryFileW");
+    gWin.dragFinish      = resolveIn(s32b, "DragFinish");
+
+    // ---- M8 音频（winmm，按需加载）----
+    let wmmb: *u8 = ensureModule("winmm.dll");
+    gWin.waveOutOpen            = resolveIn(wmmb, "waveOutOpen");
+    gWin.waveOutClose           = resolveIn(wmmb, "waveOutClose");
+    gWin.waveOutWrite           = resolveIn(wmmb, "waveOutWrite");
+    gWin.waveOutPrepareHeader   = resolveIn(wmmb, "waveOutPrepareHeader");
+    gWin.waveOutUnprepareHeader = resolveIn(wmmb, "waveOutUnprepareHeader");
+    gWin.waveOutReset           = resolveIn(wmmb, "waveOutReset");
+
+    return gWin.registerClassExW != 0 && gWin.createWindowExW != 0 &&
+           gWin.getMessageW != 0 && gWin.defWindowProcW != 0;
+}
+
+// ---------------------------------------------------------------------------
+//  调用辅助：参数统一以 u64 传递（整数 / 指针共用寄存器）
+// ---------------------------------------------------------------------------
+
+pub fn wcall0(f: u64) -> u64 {
+    let fp: fn() -> u64 = f as fn() -> u64;
+    return fp();
+}
+
+pub fn wcall1(f: u64, a1: u64) -> u64 {
+    let fp: fn(u64) -> u64 = f as fn(u64) -> u64;
+    return fp(a1);
+}
+
+pub fn wcall2(f: u64, a1: u64, a2: u64) -> u64 {
+    let fp: fn(u64, u64) -> u64 = f as fn(u64, u64) -> u64;
+    return fp(a1, a2);
+}
+
+pub fn wcall3(f: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let fp: fn(u64, u64, u64) -> u64 = f as fn(u64, u64, u64) -> u64;
+    return fp(a1, a2, a3);
+}
+
+pub fn wcall4(f: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64) -> u64 = f as fn(u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4);
+}
+
+pub fn wcall5(f: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64, u64) -> u64 = f as fn(u64, u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4, a5);
+}
+
+pub fn wcall6(f: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64, u64, u64) -> u64 =
+        f as fn(u64, u64, u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4, a5, a6);
+}
+
+/// BitBlt 需要 9 个参数（第 5 个起压栈）。
+pub fn wcall9(f: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64,
+              a7: u64, a8: u64, a9: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+        f as fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4, a5, a6, a7, a8, a9);
+}
+
+pub fn wcall12(f: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64,
+               a7: u64, a8: u64, a9: u64, a10: u64, a11: u64, a12: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+        f as fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
+}
+
+/// StretchDIBits 需要 13 个参数（hdc / 目标 4 / 源 4 / lpBits / lpbmi / iUsage / rop）。
+pub fn wcall13(f: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64,
+               a7: u64, a8: u64, a9: u64, a10: u64, a11: u64, a12: u64, a13: u64) -> u64 {
+    let fp: fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+        f as fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    return fp(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
+}
+
+// ---------------------------------------------------------------------------
+//  进程与字符串
+// ---------------------------------------------------------------------------
+
+/// 当前进程映像基址（即 HINSTANCE）：PEB + 0x10
+pub fn imageBase() -> u64 {
+    let peb: *u8 = read_gs(0x60) as *u8;
+    if (peb as u64) == 0 {
+        return 0;
+    }
+    return *((peb + 0x10) as *u64);
+}
+
+/// UTF-8 → UTF-16 写入调用者缓冲，返回码元数
+pub fn winWStr(dst: *u16, cap: u64, s: *u8) -> u64 {
+    return utf8ToU16(s, dst, cap);
+}
+
+pub fn winMsgBox(hwnd: u64, text: *u8, caption: *u8, flags: u32) -> u64 {
+    var t: [512]u16;
+    var c: [128]u16;
+    winWStr(&t[0], 512, text);
+    winWStr(&c[0], 128, caption);
+    return wcall4(gWin.messageBoxW, hwnd, &t[0] as u64, &c[0] as u64, flags as u64);
+}
+
+// ---------------------------------------------------------------------------
+//  窗口
+// ---------------------------------------------------------------------------
+
+// 注：winRegisterClass 的实现在本文件后部（作为 winRegisterClassEx 的包装）。
+// 此处曾另有一份等价的手工实现，导致「同一模块内函数重复定义: winRegisterClass」——
+// 所有 import win32.tc 的程序（如 games/neonbreak）都会编译失败。已删除。
+
+/// 创建顶层窗口（固定尺寸，系统决定初始位置）
+pub fn winCreateWindow(className: *u8, title: *u8, w: i32, h: i32) -> u64 {
+    var cn: [64]u16;
+    var tt: [256]u16;
+    winWStr(&cn[0], 64, className);
+    winWStr(&tt[0], 256, title);
+    let style: u32 = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    return wcall12(gWin.createWindowExW,
+                   0, &cn[0] as u64, &tt[0] as u64, style as u64,
+                   CW_USEDEFAULT, CW_USEDEFAULT, w as u64, h as u64,
+                   0, 0, imageBase(), 0);
+}
+
+pub fn winShow(hwnd: u64, cmd: i32) -> void {
+    wcall2(gWin.showWindow, hwnd, cmd as u64);
+    wcall1(gWin.updateWindow, hwnd);
+}
+
+pub fn winSetTitle(hwnd: u64, title: *u8) -> void {
+    var tt: [256]u16;
+    winWStr(&tt[0], 256, title);
+    wcall2(gWin.setWindowTextW, hwnd, &tt[0] as u64);
+}
+
+/// 消息循环；返回退出码
+pub fn winRun() -> i32 {
+    var msg: WinMsg;
+    var more: i64 = 1;
+    while more > 0 {
+        more = wcall4(gWin.getMessageW, &msg as u64, 0, 0, 0) as i64;
+        if more > 0 {
+            wcall1(gWin.translateMessage, &msg as u64);
+            wcall1(gWin.dispatchMessageW, &msg as u64);
+        }
+    }
+    return msg.wParam as i32;
+}
+
+pub fn winTimer(hwnd: u64, id: u64, ms: u32) -> void {
+    wcall4(gWin.setTimer, hwnd, id, ms as u64, 0);
+}
+
+pub fn winKillTimer(hwnd: u64, id: u64) -> void {
+    wcall2(gWin.killTimer, hwnd, id);
+}
+
+pub fn winInvalidate(hwnd: u64) -> void {
+    wcall2(gWin.invalidateRect, hwnd, 0);
+}
+
+// ---------------------------------------------------------------------------
+//  控件
+// ---------------------------------------------------------------------------
+
+/// 创建子控件（按钮 / 勾选框）
+pub fn winControl(parent: u64, ctlId: u64, classUtf8: *u8, text: *u8,
+                  x: i32, y: i32, w: i32, h: i32, style: u32) -> u64 {
+    var cn: [32]u16;
+    var tt: [128]u16;
+    winWStr(&cn[0], 32, classUtf8);
+    winWStr(&tt[0], 128, text);
+    let st: u32 = WS_CHILD | WS_VISIBLE | WS_TABSTOP | style;
+    return wcall12(gWin.createWindowExW, 0, &cn[0] as u64, &tt[0] as u64, st as u64,
+                   x as u64, y as u64, w as u64, h as u64,
+                   parent, ctlId, 0, 0);
+}
+
+pub fn winSetFont(hwnd: u64) -> void {
+    let hf: u64 = wcall1(gWin.getStockObject, DEFAULT_GUI_FONT);
+    wcall4(gWin.sendMessageW, hwnd, WM_SETFONT as u64, hf, 1);
+}
+
+pub fn winShowCtl(hwnd: u64, visible: bool) -> void {
+    if visible {
+        wcall2(gWin.showWindow, hwnd, SW_SHOW as u64);
+    } else {
+        wcall2(gWin.showWindow, hwnd, SW_HIDE as u64);
+    }
+}
+
+pub fn winSetCtlText(hwnd: u64, text: *u8) -> void {
+    var tt: [128]u16;
+    winWStr(&tt[0], 128, text);
+    wcall2(gWin.setWindowTextW, hwnd, &tt[0] as u64);
+}
+
+pub fn winCheckState(hwnd: u64) -> bool {
+    return wcall4(gWin.sendMessageW, hwnd, BM_GETCHECK as u64, 0, 0) == 1;
+}
+
+// ---------------------------------------------------------------------------
+//  绘制
+// ---------------------------------------------------------------------------
+
+pub fn winFill(hdc: u64, left: i32, top: i32, right: i32, bottom: i32, color: u32) -> void {
+    var r: Rect;
+    r.left = left; r.top = top; r.right = right; r.bottom = bottom;
+    let b: u64 = wcall1(gWin.createSolidBrush, color as u64);
+    wcall3(gWin.fillRect, hdc, &r as u64, b);
+    wcall1(gWin.deleteObject, b);
+}
+
+pub fn winFrame(hdc: u64, left: i32, top: i32, right: i32, bottom: i32, color: u32) -> void {
+    var r: Rect;
+    r.left = left; r.top = top; r.right = right; r.bottom = bottom;
+    let b: u64 = wcall1(gWin.createSolidBrush, color as u64);
+    wcall3(gWin.frameRect, hdc, &r as u64, b);
+    wcall1(gWin.deleteObject, b);
+}
+
+pub fn winTextColor(hdc: u64, color: u32) -> void {
+    wcall2(gWin.setTextColor, hdc, color as u64);
+}
+
+pub fn winSetFontHdc(hdc: u64) -> void {
+    let hf: u64 = wcall1(gWin.getStockObject, DEFAULT_GUI_FONT);
+    wcall2(gWin.selectObject, hdc, hf);
+}
+
+/// 绘制 UTF-8 文本；fmt 传 DT_* 组合
+pub fn winText(hdc: u64, text: *u8, left: i32, top: i32, right: i32, bottom: i32, fmt: u32) -> void {
+    var t: [640]u16;
+    winWStr(&t[0], 640, text);
+    var r: Rect;
+    r.left = left; r.top = top; r.right = right; r.bottom = bottom;
+    wcall2(gWin.setBkMode, hdc, TRANSPARENT as u64);
+    wcall5(gWin.drawTextW, hdc, &t[0] as u64, 0xFFFFFFFF, &r as u64, fmt as u64);
+}
+
+/// 进度条（0..100）
+pub fn winProgress(hdc: u64, left: i32, top: i32, right: i32, bottom: i32, pct: i32) -> void {
+    winFill(hdc, left, top, right, bottom, 0x00E8E8E8);
+    if pct > 0 {
+        if pct > 100 { pct = 100; }
+        let w: i32 = right - left - 4;
+        let fillW: i32 = w * pct / 100;
+        winFill(hdc, left + 2, top + 2, left + 2 + fillW, bottom - 2, 0x00C07000);
+    }
+    winFrame(hdc, left, top, right, bottom, 0x00A0A0A0);
+}
+
+/// 左上角 Logo：蓝色方块 + 白色 "TC"
+pub fn winLogo(hdc: u64, left: i32, top: i32) -> void {
+    winFill(hdc, left, top, left + 48, top + 48, 0x00C07000);
+    winFill(hdc, left + 4, top + 4, left + 44, top + 44, 0x00A05800);
+    winTextColor(hdc, 0x00FFFFFF);
+    winText(hdc, "TC", left, top + 12, left + 48, top + 52, DT_CENTER | DT_SINGLELINE);
+    winTextColor(hdc, 0x00303030);
+}
+
+// ===========================================================================
+//  M7.1 播放器扩展：帧呈现 / 高精度计时 / 输入 / 非阻塞消息泵
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+//  帧呈现：DIB 后台缓冲（32bpp top-down BGRA）+ StretchDIBits 缩放贴图
+// ---------------------------------------------------------------------------
+
+pub struct FrameBuffer {
+    dc: u64;        // 内存 DC（位图已选入）
+    bmp: u64;       // DIB 位图
+    old: u64;       // 创建时内存 DC 中的原位图（销毁前还原）
+    bits: *u32;     // 像素基址（BGRA，u32 = 0xAARRGGBB）
+    w: i32;
+    h: i32;
+    pitch: i32;     // 每行像素数（32bpp）
+}
+
+fn makeBi(bi: *u8, w: i32, h: i32, usage: u32) -> void {
+    let p: *u32 = bi as *u32;
+    p[0] = 40;
+    p[1] = w as u32;
+    p[2] = (0 - h) as u32;        // 负数 → top-down（行 0 在顶部）
+    p[3] = 1 | (32 << 16);        // planes = 1，bitCount = 32
+    p[4] = usage;                 // BI_RGB
+    p[5] = 0;
+    p[6] = 0;
+    p[7] = 0;
+    p[8] = 0;
+    p[9] = 0;
+}
+
+/// 创建 32bpp top-down DIB 后台缓冲；光栅器直接写 fb->bits。
+/// wnd 用于取兼容 DC（传 0 时退化为屏幕 DC）。
+pub fn fbCreate(fb: *FrameBuffer, wnd: u64, w: i32, h: i32) -> bool {
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let hdcRef: u64 = wcall1(gWin.getDC, wnd);
+    if hdcRef == 0 {
+        return false;
+    }
+    let dc: u64 = wcall1(gWin.createCompatibleDC, hdcRef);
+    wcall2(gWin.releaseDC, wnd, hdcRef);
+    if dc == 0 {
+        return false;
+    }
+
+    var bi: [44]u8;
+    makeBi(&bi[0], w, h, BI_RGB);
+    var bits: u64 = 0;
+    let bmp: u64 = wcall6(gWin.createDIBSection, dc, &bi[0] as u64,
+                          DIB_RGB_COLORS as u64, &bits as u64, 0, 0);
+    if bmp == 0 || bits == 0 {
+        wcall1(gWin.deleteDC, dc);
+        return false;
+    }
+    let old: u64 = wcall2(gWin.selectObject, dc, bmp);
+
+    fb->dc = dc;
+    fb->bmp = bmp;
+    fb->old = old;
+    fb->bits = bits as *u32;
+    fb->w = w;
+    fb->h = h;
+    fb->pitch = w;
+    return true;
+}
+
+pub fn fbDestroy(fb: *FrameBuffer) -> void {
+    if fb->dc != 0 {
+        if fb->old != 0 {
+            wcall2(gWin.selectObject, fb->dc, fb->old);
+        }
+        wcall1(gWin.deleteDC, fb->dc);
+    }
+    if fb->bmp != 0 {
+        wcall1(gWin.deleteObject, fb->bmp);
+    }
+    fb->dc = 0;
+    fb->bmp = 0;
+    fb->old = 0;
+    fb->bits = null;
+}
+
+/// 把后台缓冲缩放到目标 DC 的 (x, y, dw, dh) 矩形（COLORONCOLOR 快速路径）。
+pub fn fbPresent(fb: *FrameBuffer, hdc: u64, x: i32, y: i32, dw: i32, dh: i32) -> void {
+    if fb->bmp == 0 || fb->bits == null || dw <= 0 || dh <= 0 {
+        return;
+    }
+    var bi: [44]u8;
+    makeBi(&bi[0], fb->w, fb->h, BI_RGB);
+    wcall2(gWin.setStretchBltMode, hdc, COLORONCOLOR as u64);
+    wcall13(gWin.stretchDIBits, hdc,
+            x as u64, y as u64, dw as u64, dh as u64,
+            0, 0, fb->w as u64, fb->h as u64,
+            fb->bits as u64, &bi[0] as u64,
+            DIB_RGB_COLORS as u64, SRCCOPY as u64);
+}
+
+/// 直线拷贝（尺寸一致时的快速路径）
+pub fn fbBlit(fb: *FrameBuffer, hdc: u64, x: i32, y: i32) -> void {
+    if fb->dc == 0 {
+        return;
+    }
+    wcall9(gWin.bitBlt, hdc, x as u64, y as u64, fb->w as u64, fb->h as u64,
+           fb->dc, 0, 0, SRCCOPY as u64);
+}
+
+// ---------------------------------------------------------------------------
+//  高精度计时（QPC）
+// ---------------------------------------------------------------------------
+
+var gQpcFreq: u64 = 0;
+
+pub fn qpcFrequency() -> u64 {
+    if gQpcFreq == 0 {
+        var f: u64 = 0;
+        wcall1(gWin.queryPerformanceFrequency, &f as u64);
+        gQpcFreq = f;
+    }
+    return gQpcFreq;
+}
+
+pub fn qpcNow() -> u64 {
+    var t: u64 = 0;
+    wcall1(gWin.queryPerformanceCounter, &t as u64);
+    return t;
+}
+
+/// 自 start（qpcNow 的返回值）起经过的微秒数
+pub fn qpcMicros(start: u64) -> u64 {
+    let f: u64 = qpcFrequency();
+    if f == 0 {
+        return 0;
+    }
+    return (qpcNow() - start) * 1000000 / f;
+}
+
+pub fn winSleep(ms: u32) -> void {
+    wcall1(gWin.sleep, ms as u64);
+}
+
+// ---------------------------------------------------------------------------
+//  输入与消息泵
+// ---------------------------------------------------------------------------
+
+/// 某虚拟键当前是否按下（高位有效）
+pub fn keyDown(vk: u64) -> bool {
+    return ((wcall1(gWin.getAsyncKeyState, vk) as i32) & 0x8000) != 0;
+}
+
+/// 非阻塞抽干消息队列；返回 false 表示收到 WM_QUIT（应退出主循环）
+pub fn winPump() -> bool {
+    var msg: WinMsg;
+    while wcall5(gWin.peekMessageW, &msg as u64, 0, 0, 0, PM_REMOVE as u64) != 0 {
+        if msg.message == WM_QUIT {
+            return false;
+        }
+        wcall1(gWin.translateMessage, &msg as u64);
+        wcall1(gWin.dispatchMessageW, &msg as u64);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+//  可缩放窗口
+// ---------------------------------------------------------------------------
+
+/// 注册窗口类（类样式 0，白色背景）——安装程序等既有调用点保持不变
+pub fn winRegisterClass(className: *u8, wndProc: fn(u64, u32, u64, i64) -> i64) -> bool {
+    return winRegisterClassEx(className, wndProc, 0, 0x00FFFFFF);
+}
+
+/// 注册窗口类（指定类样式与背景色）
+pub fn winRegisterClassEx(className: *u8, wndProc: fn(u64, u32, u64, i64) -> i64,
+                          style: u32, bg: u32) -> bool {
+    var cn: [64]u16;
+    winWStr(&cn[0], 64, className);
+
+    let brush: u64 = wcall1(gWin.createSolidBrush, bg as u64);
+    var wc: WndClassEx;
+    wc.cbSize = 80;
+    wc.style = style;
+    wc.lpfnWndProc = wndProc as u64;
+    wc.cbClsExtra = 0;
+    wc.cbWndExtra = 0;
+    wc.hInstance = imageBase();
+    wc.hIcon = 0;
+    wc.hCursor = wcall2(gWin.loadCursorW, 0, IDC_ARROW);
+    wc.hbrBackground = brush;
+    wc.lpszMenuName = 0;
+    wc.lpszClassName = &cn[0] as u64;
+    wc.hIconSm = 0;
+
+    let atom: u64 = wcall1(gWin.registerClassExW, &wc as u64);
+    return atom != 0;
+}
+
+/// 创建可缩放顶层窗口；cw / ch 为**客户区**尺寸（外框经 AdjustWindowRect 反算）
+pub fn winCreateWindowFramed(className: *u8, title: *u8, cw: i32, ch: i32) -> u64 {
+    var cn: [64]u16;
+    var tt: [256]u16;
+    winWStr(&cn[0], 64, className);
+    winWStr(&tt[0], 256, title);
+
+    let style: u32 = WS_OVERLAPPEDWINDOW;
+    var r: Rect;
+    r.left = 0;
+    r.top = 0;
+    r.right = cw;
+    r.bottom = ch;
+    wcall3(gWin.adjustWindowRect, &r as u64, style as u64, 0);
+
+    return wcall12(gWin.createWindowExW,
+                   0, &cn[0] as u64, &tt[0] as u64, style as u64,
+                   CW_USEDEFAULT, CW_USEDEFAULT,
+                   (r.right - r.left) as u64, (r.bottom - r.top) as u64,
+                   0, 0, imageBase(), 0);
+}
+
+/// 取客户区尺寸
+pub fn winClientSize(hwnd: u64, w: *i32, h: *i32) -> void {
+    var r: Rect;
+    wcall2(gWin.getClientRect, hwnd, &r as u64);
+    *w = r.right - r.left;
+    *h = r.bottom - r.top;
+}
+
+// ---------------------------------------------------------------------------
+//  文件拖放（M7 UI）
+// ---------------------------------------------------------------------------
+
+/// 允许把文件拖入窗口（内部注册 WS_EX_ACCEPTFILES；调用后窗口收到 WM_DROPFILES）
+pub fn winAcceptDrops(hwnd: u64) -> void {
+    if gWin.dragAcceptFiles != 0 {
+        wcall2(gWin.dragAcceptFiles, hwnd, 1);
+    }
+}
+
+/// UTF-16LE → UTF-8（含代理对；写入结尾 NUL）。返回字节数。
+pub fn u16ToUtf8(src: *u16, dst: *u8, cap: u64) -> u64 {
+    var n: u64 = 0;
+    var i: u64 = 0;
+    while src[i] != 0 && n + 4 < cap {
+        let c: u64 = src[i] as u64;
+        var cp: u64 = c;
+        if c >= 0xD800 && c <= 0xDBFF {
+            let lo: u64 = src[i + 1] as u64;
+            if lo >= 0xDC00 && lo <= 0xDFFF {
+                cp = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                i = i + 1;
+            }
+        }
+        if cp < 0x80 {
+            dst[n] = cp as u8;
+            n = n + 1;
+        } else if cp < 0x800 {
+            dst[n] = (0xC0 | (cp >> 6)) as u8;
+            dst[n + 1] = (0x80 | (cp & 0x3F)) as u8;
+            n = n + 2;
+        } else if cp < 0x10000 {
+            dst[n] = (0xE0 | (cp >> 12)) as u8;
+            dst[n + 1] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            dst[n + 2] = (0x80 | (cp & 0x3F)) as u8;
+            n = n + 3;
+        } else {
+            dst[n] = (0xF0 | (cp >> 18)) as u8;
+            dst[n + 1] = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+            dst[n + 2] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            dst[n + 3] = (0x80 | (cp & 0x3F)) as u8;
+            n = n + 4;
+        }
+        i = i + 1;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+/// 从 WM_DROPFILES 的 wParam（HDROP）取出第 index 个文件路径（UTF-8）。
+/// 返回路径字节数；0 表示失败。
+pub fn dragFilePath(hdrop: u64, index: u64, out: *u8, cap: u64) -> u64 {
+    if gWin.dragQueryFileW == 0 {
+        return 0;
+    }
+    var wbuf: [1024]u16;
+    var wcap: u64 = 1024;
+    if cap * 2 < wcap {
+        wcap = cap * 2;
+    }
+    let n: u64 = wcall4(gWin.dragQueryFileW, hdrop, index, &wbuf[0] as u64, wcap);
+    if n == 0 {
+        return 0;
+    }
+    return u16ToUtf8(&wbuf[0], out, cap);
+}
+
+/// 拖放句柄用完必须释放
+pub fn dragDone(hdrop: u64) -> void {
+    if gWin.dragFinish != 0 {
+        wcall1(gWin.dragFinish, hdrop);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  波形音频输出（winmm / waveOut）
+// ---------------------------------------------------------------------------
+
+/// 打开波形输出设备（回调到窗口，WOM_DONE 通知播放完成）。
+/// 返回 0 表示失败。成功返回 hWaveOut。
+pub fn winWaveOpen(hwnd: u64, channels: i32, sampleRate: i32, bitsPerSample: i32) -> u64 {
+    if gWin.waveOutOpen == 0 {
+        return 0;
+    }
+    var wf: WaveFormatEx;
+    wf.wFormatTag = WAVE_FORMAT_PCM as u16;
+    wf.nChannels = channels as u16;
+    wf.nSamplesPerSec = sampleRate as u32;
+    wf.wBitsPerSample = bitsPerSample as u16;
+    wf.nBlockAlign = ((channels * bitsPerSample) / 8) as u16;
+    wf.nAvgBytesPerSec = (sampleRate as u32) * (wf.nBlockAlign as u32);
+    wf.cbSize = 0;
+
+    var hwo: u64 = 0;
+    let r: u64 = wcall6(gWin.waveOutOpen,
+                        &hwo as u64,
+                        WAVE_MAPPER as u64,
+                        &wf as u64,
+                        hwnd,
+                        0,
+                        CALLBACK_WINDOW as u64);
+    if r != 0 {
+        return 0;
+    }
+    return hwo;
+}
+
+pub fn winWaveClose(hwo: u64) -> void {
+    if hwo != 0 && gWin.waveOutClose != 0 {
+        wcall1(gWin.waveOutClose, hwo);
+    }
+}
+
+pub fn winWaveReset(hwo: u64) -> void {
+    if hwo != 0 && gWin.waveOutReset != 0 {
+        wcall1(gWin.waveOutReset, hwo);
+    }
+}
+
+/// 准备缓冲区（填充 hdr.lpData / hdr.dwBufferLength 后调用）
+/// MMRESULT 为 32 位，x64 下 RAX 高 32 位可能残留垃圾，需按 u32 判定。
+pub fn winWavePrepare(hwo: u64, hdr: *WaveHdr) -> bool {
+    if hwo == 0 || gWin.waveOutPrepareHeader == 0 {
+        return false;
+    }
+    return (wcall3(gWin.waveOutPrepareHeader, hwo, hdr as u64, 48) as u32) == 0;
+}
+
+pub fn winWaveUnprepare(hwo: u64, hdr: *WaveHdr) -> void {
+    if hwo != 0 && gWin.waveOutUnprepareHeader != 0 {
+        wcall3(gWin.waveOutUnprepareHeader, hwo, hdr as u64, 48);
+    }
+}
+
+/// 提交缓冲区播放；返回 false 表示失败（MMRESULT 按 u32 判定）
+pub fn winWaveWrite(hwo: u64, hdr: *WaveHdr) -> bool {
+    if hwo == 0 || gWin.waveOutWrite == 0 {
+        return false;
+    }
+    return (wcall3(gWin.waveOutWrite, hwo, hdr as u64, 48) as u32) == 0;
+}

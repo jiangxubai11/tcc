@@ -1,0 +1,401 @@
+// =============================================================================
+//  tcrt/sys/nt.tc — NT 内核接口绑定
+// -----------------------------------------------------------------------------
+//  TC 程序不导入 ntdll.dll，也不通过 kernel32.dll。系统调用号在不同
+//  Windows 版本上并不相同，因此必须在启动时从内存中的 ntdll 映像里读出来：
+//
+//      PEB ─→ Ldr ─→ InMemoryOrderModuleList
+//           ─→ 逐个模块比对 BaseDllName，找到 ntdll.dll
+//           ─→ 解析该模块的 PE 导出目录，定位目标函数
+//           ─→ 从函数桩的 `mov eax, imm32` 中取出系统调用号
+//
+//  取出的编号缓存进全局表 gNt，此后所有系统调用都是一条 `syscall` 指令。
+// =============================================================================
+
+module rt.sys.nt;
+
+// ---------------------------------------------------------------------------
+//  NTSTATUS 与常用常量
+// ---------------------------------------------------------------------------
+
+/// STATUS_SUCCESS == 0；其余负值表示失败（最高位为 1）
+pub const MEM_COMMIT:  u32 = 0x1000;
+pub const MEM_RESERVE: u32 = 0x2000;
+pub const MEM_RELEASE: u32 = 0x8000;
+pub const PAGE_READWRITE: u32 = 0x04;
+pub const PAGE_READONLY:  u32 = 0x02;
+pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+pub const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
+
+pub const FILE_SUPERSEDE:    u32 = 0;
+pub const FILE_OPEN:         u32 = 1;
+pub const FILE_CREATE:       u32 = 2;
+pub const FILE_OPEN_IF:      u32 = 3;
+pub const FILE_OVERWRITE:    u32 = 4;
+pub const FILE_OVERWRITE_IF: u32 = 5;
+
+pub const FILE_DIRECTORY_FILE:             u32 = 0x00000001;
+pub const FILE_NON_DIRECTORY_FILE:         u32 = 0x00000040;
+pub const FILE_SYNCHRONOUS_IO_NONALERT:    u32 = 0x00000020;
+
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+
+pub const GENERIC_READ:    u32 = 0x80000000;
+pub const GENERIC_WRITE:   u32 = 0x40000000;
+pub const SYNCHRONIZE:     u32 = 0x00100000;
+pub const FILE_READ_DATA:  u32 = 0x00000001;
+pub const FILE_WRITE_DATA: u32 = 0x00000002;
+pub const FILE_APPEND_DATA:u32 = 0x00000004;
+pub const FILE_READ_ATTRIBUTES: u32 = 0x00000080;
+
+pub const FILE_SHARE_READ:   u32 = 1;
+pub const FILE_SHARE_WRITE:  u32 = 2;
+pub const FILE_SHARE_DELETE: u32 = 4;
+
+/// FileStandardInformation —— 用于查询文件大小
+pub const FILE_STANDARD_INFORMATION_CLASS: u32 = 5;
+
+/// NtCurrentProcess() / NtCurrentThread() 的伪句柄
+pub const CURRENT_PROCESS: u64 = 0xFFFFFFFFFFFFFFFF;
+pub const CURRENT_THREAD:  u64 = 0xFFFFFFFFFFFFFFFE;
+
+// ---------------------------------------------------------------------------
+//  NT 结构（布局按 x64 对齐规则手工展开）
+// ---------------------------------------------------------------------------
+
+pub struct UnicodeString {
+    len: u16;          // +0x00  字节数，不含结尾 NUL
+    maxLen: u16;       // +0x02
+    pad: u32;          // +0x04
+    buffer: *u16;      // +0x08
+}                      // size 16
+
+pub struct ObjectAttributes {
+    length: u32;       // +0x00
+    pad0: u32;
+    rootDir: u64;      // +0x08
+    name: *UnicodeString;   // +0x10
+    attrs: u32;        // +0x18
+    pad1: u32;
+    secDesc: u64;      // +0x20
+    secQos: u64;       // +0x28
+}                      // size 48
+
+pub struct IoStatusBlock {
+    status: i64;       // +0x00
+    information: u64;  // +0x08
+}                      // size 16
+
+pub struct FileStandardInfo {
+    allocationSize: i64;   // +0x00
+    endOfFile: i64;        // +0x08
+    numberOfLinks: u32;    // +0x10
+    deletePending: u8;     // +0x14
+    directory: u8;         // +0x15
+    pad: u16;
+}                          // size 24
+
+// ---------------------------------------------------------------------------
+//  系统调用号表
+// ---------------------------------------------------------------------------
+
+pub struct NtTable {
+    allocateVirtualMemory: u32;
+    freeVirtualMemory: u32;
+    protectVirtualMemory: u32;
+    readFile: u32;
+    writeFile: u32;
+    openFile: u32;
+    createFile: u32;
+    close: u32;
+    queryInformationFile: u32;
+    queryVolumeInformationFile: u32;
+    terminateProcess: u32;
+    delayExecution: u32;
+    querySystemTime: u32;
+}
+
+/// 全局系统调用表。由 rtInitSyscalls 填充，此后全程只读。
+pub var gNt: NtTable;
+
+// ---------------------------------------------------------------------------
+//  标准句柄
+// ---------------------------------------------------------------------------
+//
+//  注意：`-11` 这类值只是 kernel32 的伪句柄约定 —— NtWriteFile 把它们当作
+//  普通句柄值，内核会返回 STATUS_INVALID_HANDLE。真正的标准句柄存放在
+//  RTL_USER_PROCESS_PARAMETERS 里，必须在启动时读出来：
+//
+//      PEB + 0x20  →  ProcessParameters
+//      ProcessParameters + 0x20  →  StandardInput
+//      ProcessParameters + 0x28  →  StandardOutput
+//      ProcessParameters + 0x30  →  StandardError
+pub var gStdIn:  u64;
+pub var gStdOut: u64;
+pub var gStdErr: u64;
+
+/// 读取标准句柄。未初始化时返回 0。
+fn loadStdHandles() -> void {
+    let peb: *u8 = read_gs(0x60) as *u8;
+    if (peb as u64) == 0 {
+        return;
+    }
+    let ppPtr: *u64 = (peb + 0x20) as *u64;
+    let pp: *u8 = (*ppPtr) as *u8;
+    if (pp as u64) == 0 {
+        return;
+    }
+    gStdIn  = *((pp + 0x20) as *u64);
+    gStdOut = *((pp + 0x28) as *u64);
+    gStdErr = *((pp + 0x30) as *u64);
+}
+
+// ---------------------------------------------------------------------------
+//  PEB / LDR 结构（只声明用到的前缀，避免无关字段）
+// ---------------------------------------------------------------------------
+
+struct ListEntry {
+    flink: *ListEntry;
+    blink: *ListEntry;
+}
+
+struct LdrEntry {
+    links: ListEntry;          // +0x00
+    _order2: ListEntry;        // +0x10
+    _order3: ListEntry;        // +0x20
+    dllBase: *u8;              // +0x30
+    entryPoint: *u8;           // +0x38
+    sizeOfImage: u32;          // +0x40
+    _pad: u32;
+    fullDllName: UnicodeString;   // +0x48
+    baseDllName: UnicodeString;   // +0x58
+}
+
+struct PebLdrData {
+    length: u32;               // +0x00
+    initialized: u8;           // +0x04
+    // 必须用三个 u8 补齐到 0x08。若写成 u32，字段自身会被对齐到 0x08，
+    // 导致 ssHandle 落到 0x10、整个链表错位 8 字节。
+    _p1: u8; _p2: u8; _p3: u8; // +0x05
+    ssHandle: u64;             // +0x08
+    inLoadOrder: ListEntry;    // +0x10
+    inMemoryOrder: ListEntry;  // +0x20
+    inInitOrder: ListEntry;    // +0x30
+}
+
+struct Peb {
+    _f00: u64;
+    _f08: u64;
+    _f10: u64;
+    ldr: *PebLdrData;          // +0x18
+}
+
+// ---------------------------------------------------------------------------
+//  模块名比对：UTF-16LE 缓冲区 vs ASCII 字面量
+// ---------------------------------------------------------------------------
+
+/// 大小写不敏感的 ASCII 比较。先检查 ASCII 串是否结束 ——
+/// 反过来会把完全匹配误判为不等。
+fn nameEqAscii(buf: *u16, lenBytes: u16, ascii: *u8) -> bool {
+    var i: u64 = 0;
+    let n: u64 = lenBytes as u64;
+    while true {
+        let a: u8 = ascii[i];
+        if a == 0 {
+            return (i * 2) == n;
+        }
+        if i * 2 >= n {
+            return false;
+        }
+        var c: u64 = buf[i] as u64;
+        if c >= 65 && c <= 90 {
+            c = c + 32;
+        }
+        var t: u64 = a as u64;
+        if t >= 65 && t <= 90 {
+            t = t + 32;
+        }
+        if c != t {
+            return false;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 在已加载模块中按名字查找基址；找不到返回 0
+pub fn findModule(name: *u8) -> *u8 {
+    let peb: *Peb = read_gs(0x60) as *Peb;
+    if (peb as u64) == 0 {
+        return null;
+    }
+    let ldr: *PebLdrData = peb->ldr;
+    if (ldr as u64) == 0 {
+        return null;
+    }
+
+    let head: *ListEntry = &ldr->inLoadOrder;
+    var cur: *ListEntry = head->flink;
+    var guard: u64 = 0;
+    while (cur as u64) != (head as u64) && guard < 512 {
+        let rec: *LdrEntry = cur as *LdrEntry;
+        let nm: *UnicodeString = &rec->baseDllName;
+        if (nm->buffer as u64) != 0 && nameEqAscii(nm->buffer, nm->len, name) {
+            return rec->dllBase;
+        }
+        cur = cur->flink;
+        guard = guard + 1;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+//  PE 导出表解析
+// ---------------------------------------------------------------------------
+
+struct PeDosHeader {
+    e_magic: u16;      // +0x00
+    _f02: u16; _f04: u16; _f06: u16; _f08: u16; _f0a: u16;
+    _f0c: u16; _f0e: u16; _f10: u16; _f12: u16; _f14: u16;
+    _f16: u16; _f18: u16; _f1a: u16; _f1c: u16; _f1e: u16;
+    _f20: u16; _f22: u16; _f24: u16; _f26: u16; _f28: u16;
+    _f2a: u16; _f2c: u16; _f2e: u16; _f30: u16; _f32: u16;
+    _f34: u16; _f36: u16; _f38: u16; _f3a: u16;
+    e_lfanew: u32;     // +0x3C
+}
+
+struct PeExportDir {
+    characteristics: u32;   // +0x00
+    timestamp: u32;
+    major: u16; minor: u16;
+    nameRva: u32;           // +0x0C
+    base: u32;              // +0x10
+    numFuncs: u32;          // +0x14
+    numNames: u32;          // +0x18
+    addrFuncs: u32;         // +0x1C   RVA → 函数地址表
+    addrNames: u32;         // +0x20   RVA → 名字指针表
+    addrOrds: u32;          // +0x24   RVA → 序号表
+}
+
+/// 在模块基址上查找导出函数。返回函数地址（映像内绝对地址），失败返回 0。
+pub fn findExport(base: *u8, name: *u8) -> *u8 {
+    if (base as u64) == 0 {
+        return null;
+    }
+    let dos: *PeDosHeader = base as *PeDosHeader;
+    if dos->e_magic != 0x5A4D {
+        return null;
+    }
+    let ntOff: u64 = dos->e_lfanew as u64;
+    // PE 签名(4) + 文件头(20) + 可选头(240 for PE32+) → 数据目录起点
+    let ddOff: u64 = ntOff + 4 + 20 + 112;
+    let expRva: u32 = *((base + ddOff) as *u32);
+    if expRva == 0 {
+        return null;
+    }
+    let dir: *PeExportDir = (base + (expRva as u64)) as *PeExportDir;
+
+    var i: u32 = 0;
+    while i < dir->numNames {
+        let nameRvaPtr: *u32 = (base + (dir->addrNames as u64) + (i as u64) * 4) as *u32;
+        let nRva: u32 = *nameRvaPtr;
+        let nPtr: *u8 = base + (nRva as u64);
+        if cstrEq(nPtr, name) {
+            let ordPtr: *u16 = (base + (dir->addrOrds as u64) + (i as u64) * 2) as *u16;
+            let ord: u32 = *ordPtr as u32;
+            let fRvaPtr: *u32 = (base + (dir->addrFuncs as u64) + (ord as u64) * 4) as *u32;
+            return base + (*fRvaPtr as u64);
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+/// 两个以 NUL 结尾的 ASCII 串是否相等
+pub fn cstrEq(a: *u8, b: *u8) -> bool {
+    var i: u64 = 0;
+    while true {
+        let x: u8 = a[i];
+        let y: u8 = b[i];
+        if x != y {
+            return false;
+        }
+        if x == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 从系统调用桩中取出编号。
+/// 现代 Windows 的桩形如：  4C 8B D1          mov r10, rcx
+///                         B8 xx xx xx xx    mov eax, imm32
+/// 少数变体在前面还有 jmp / 填充，因此在首 32 字节内搜索 0xB8。
+fn syscallNumberOf(fnAddr: *u8) -> u32 {
+    if (fnAddr as u64) == 0 {
+        return 0;
+    }
+    var i: u64 = 0;
+    while i < 32 {
+        if fnAddr[i] == 0xB8 {
+            let p: *u32 = (fnAddr + i + 1) as *u32;
+            return *p;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+//  初始化
+// ---------------------------------------------------------------------------
+
+pub var gInited: bool = false;
+
+/// 已初始化则立即返回，可安全重复调用。
+pub fn rtInitSyscalls() -> bool {
+    if gInited {
+        return true;
+    }
+    let base: *u8 = findModule("ntdll.dll");
+    if (base as u64) == 0 {
+        return false;
+    }
+
+    gNt.allocateVirtualMemory  = resolveFn(base, "NtAllocateVirtualMemory");
+    gNt.freeVirtualMemory      = resolveFn(base, "NtFreeVirtualMemory");
+    gNt.protectVirtualMemory   = resolveFn(base, "NtProtectVirtualMemory");
+    gNt.readFile               = resolveFn(base, "NtReadFile");
+    gNt.writeFile              = resolveFn(base, "NtWriteFile");
+    gNt.openFile               = resolveFn(base, "NtOpenFile");
+    gNt.createFile             = resolveFn(base, "NtCreateFile");
+    gNt.close                  = resolveFn(base, "NtClose");
+    gNt.queryInformationFile   = resolveFn(base, "NtQueryInformationFile");
+    gNt.queryVolumeInformationFile = resolveFn(base, "NtQueryVolumeInformationFile");
+    gNt.terminateProcess       = resolveFn(base, "NtTerminateProcess");
+    gNt.delayExecution         = resolveFn(base, "NtDelayExecution");
+    gNt.querySystemTime        = resolveFn(base, "NtQuerySystemTime");
+
+    // 缺一不可：任何一项为 0 都说明该系统调用号提取失败
+    if gNt.allocateVirtualMemory == 0 || gNt.writeFile == 0 ||
+       gNt.createFile == 0 || gNt.close == 0 {
+        return false;
+    }
+
+    // 标准句柄必须在内核句柄可用之前读出来，否则控制台输出无处可去
+    loadStdHandles();
+
+    gInited = true;
+    return true;
+}
+
+/// 包装一层，避免在初始化过程中直接调用 resolve
+fn resolveFn(base: *u8, name: *u8) -> u32 {
+    let fnAddr: *u8 = findExport(base, name);
+    if (fnAddr as u64) == 0 {
+        return 0;
+    }
+    return syscallNumberOf(fnAddr);
+}

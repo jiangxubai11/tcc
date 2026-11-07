@@ -1,0 +1,85 @@
+// =============================================================================
+//  tclib/gfx/color.tc — 颜色打包与色彩空间基础
+// -----------------------------------------------------------------------------
+//  DIB 32bpp 的像素在内存中按 BGRA 排列，小端 u32 读作 0xAARRGGBB。
+//  本文件只做位运算与整数近似，不依赖任何运行时设施（可离线测试）。
+// =============================================================================
+
+module tc.gfx.color;
+
+// ---------------------------------------------------------------------------
+//  打包 / 解包
+// ---------------------------------------------------------------------------
+
+/// 0xAARRGGBB
+pub fn argb(a: u32, r: u32, g: u32, b: u32) -> u32 {
+    return ((a & 255) << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+}
+
+/// 不透明色
+pub fn rgb(r: u32, g: u32, b: u32) -> u32 {
+    return argb(255, r, g, b);
+}
+
+/// 灰度
+pub fn gray(v: u32) -> u32 {
+    return rgb(v, v, v);
+}
+
+pub fn colA(c: u32) -> u32 { return (c >> 24) & 255; }
+pub fn colR(c: u32) -> u32 { return (c >> 16) & 255; }
+pub fn colG(c: u32) -> u32 { return (c >> 8) & 255; }
+pub fn colB(c: u32) -> u32 { return c & 255; }
+
+// ---------------------------------------------------------------------------
+//  插值 / 混合
+// ---------------------------------------------------------------------------
+
+/// 定点线性插值：t ∈ [0, 256]，256 表示完全取 b。
+pub fn lerpColor(a: u32, b: u32, t: u32) -> u32 {
+    let it: u32 = 256 - t;
+    let r: u32 = (colR(a) * it + colR(b) * t) >> 8;
+    let g: u32 = (colG(a) * it + colG(b) * t) >> 8;
+    let bl: u32 = (colB(a) * it + colB(b) * t) >> 8;
+    let al: u32 = (colA(a) * it + colA(b) * t) >> 8;
+    return argb(al, r, g, bl);
+}
+
+/// alpha 混合：a ∈ [0, 255] 为前景不透明度（0 = 全背景，255 = 全前景）。
+/// 用 `+128 >> 8` 近似除以 255，单像素误差 ≤ 1，避免每像素除法。
+pub fn blend(dst: u32, src: u32, a: u32) -> u32 {
+    let ia: u32 = 255 - a;
+    let r: u32 = (colR(src) * a + colR(dst) * ia + 128) >> 8;
+    let g: u32 = (colG(src) * a + colG(dst) * ia + 128) >> 8;
+    let bl: u32 = (colB(src) * a + colB(dst) * ia + 128) >> 8;
+    return argb(255, r, g, bl);
+}
+
+fn clamp255(v: i32) -> u32 {
+    if v < 0 { return 0; }
+    if v > 255 { return 255; }
+    return v as u32;
+}
+
+/// YUV（BT.601 limited range，4:2:0 / 4:2:2 共用）→ 0xAARRGGBB。
+/// 整数近似：C = Y-16，D = U-128，E = V-128
+pub fn yuvToBgra(y: i32, u: i32, v: i32) -> u32 {
+    var cc: i32 = y - 16;
+    let dd: i32 = u - 128;
+    let ee: i32 = v - 128;
+    if cc < 0 { cc = 0; }
+    let r: i32 = (298 * cc + 409 * ee + 128) >> 8;
+    let g: i32 = (298 * cc - 100 * dd - 208 * ee + 128) >> 8;
+    let b: i32 = (298 * cc + 516 * dd + 128) >> 8;
+    return argb(255, clamp255(r), clamp255(g), clamp255(b));
+}
+
+/// 全范围（JPEG / full range）变体：直接以 128 为中心
+pub fn yuvToBgraFull(y: i32, u: i32, v: i32) -> u32 {
+    let dd: i32 = u - 128;
+    let ee: i32 = v - 128;
+    let r: i32 = (256 * y + 359 * ee + 128) >> 8;
+    let g: i32 = (256 * y - 88 * dd - 183 * ee + 128) >> 8;
+    let b: i32 = (256 * y + 454 * dd + 128) >> 8;
+    return argb(255, clamp255(r), clamp255(g), clamp255(b));
+}

@@ -1,0 +1,91 @@
+// =============================================================================
+//  tclib/core/fmt.tc — 输出与格式化
+// -----------------------------------------------------------------------------
+//  · 控制台直出：字符串 / 整数 / 十六进制 / 键值行
+//  · Str 构造：把数字与字符串拼进动态字符串，再一次性输出
+//  所有输出路径都经 tcrt 的 NtWriteFile，不依赖 CRT。
+// =============================================================================
+
+module tc.core.fmt;
+
+import "../../tcrt/core/mem.tc";
+import "../../tcrt/core/io.tc";
+import "str.tc";
+
+// ---------------------------------------------------------------------------
+//  控制台直出
+// ---------------------------------------------------------------------------
+
+pub fn outCStr(s: *u8) -> void {
+    rtPrint(s);
+}
+
+pub fn outI64(v: i64) -> void {
+    rtPrintI64(v);
+}
+
+pub fn outU64(v: u64) -> void {
+    rtPrintU64(v);
+}
+
+pub fn outHex(v: u64, width: u64) -> void {
+    rtPrintHex(v, width);
+}
+
+pub fn outNL() -> void {
+    rtPrint("\n");
+}
+
+/// 输出 "name = value" 一行
+pub fn outKV(name: *u8, v: i64) -> void {
+    rtPrint(name);
+    rtPrint(" = ");
+    rtPrintI64(v);
+    rtPrint("\n");
+}
+
+// ---------------------------------------------------------------------------
+//  Str 构造
+// ---------------------------------------------------------------------------
+
+pub fn fmtNew() -> Str {
+    return strNew();
+}
+
+pub fn fmtPushI64(s: *Str, v: i64) -> void {
+    strAppendI64(s, v);
+}
+
+pub fn fmtPushU64(s: *Str, v: u64) -> void {
+    strAppendU64(s, v);
+}
+
+pub fn fmtPushHex(s: *Str, v: u64, w: u64) -> void {
+    strAppendHex(s, v, w);
+}
+
+pub fn fmtPushC(s: *Str, c: *u8) -> void {
+    strAppendC(s, c);
+}
+
+/// 追加 "name = value"
+pub fn fmtPushKV(s: *Str, name: *u8, v: i64) -> void {
+    strAppendC(s, name);
+    strAppendC(s, " = ");
+    strAppendI64(s, v);
+}
+
+/// 输出 Str 内容
+pub fn fmtPrint(s: *Str) -> void {
+    if s->len > 0 {
+        rtPrintN(s->data, s->len);
+    }
+}
+
+/// 输出 Str 内容并换行
+pub fn fmtPrintLn(s: *Str) -> void {
+    if s->len > 0 {
+        rtPrintN(s->data, s->len);
+    }
+    rtPrint("\n");
+}

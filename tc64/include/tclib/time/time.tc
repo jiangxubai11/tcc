@@ -1,0 +1,58 @@
+// =============================================================================
+//  tclib/time/time.tc — 时间
+// -----------------------------------------------------------------------------
+//  经 NtQuerySystemTime 读系统时间（内核直连，无 CRT / 无 DLL）。
+//  FILETIME 以 100ns 为单位，起点 1601-01-01。
+// =============================================================================
+
+module tc.time;
+
+import "../../tcrt/sys/nt.tc";
+
+/// Unix 纪元（1970-01-01）与 FILETIME 起点的毫秒差
+pub const EPOCH_DELTA_MS: i64 = 11644473600000;
+
+/// 当前系统时间（自 1601-01-01 起的毫秒数）；失败返回 0。
+pub fn timeMillis() -> i64 {
+    var t: i64 = 0;
+    let st: i32 = syscall(gNt.querySystemTime as u64, &t as u64);
+    if st < 0 {
+        return 0;
+    }
+    return t / 10000;
+}
+
+/// 自 Unix 纪元（1970-01-01）起的毫秒数
+pub fn timeUnixMillis() -> i64 {
+    return timeMillis() - EPOCH_DELTA_MS;
+}
+
+// ---------------------------------------------------------------------------
+//  KUSER_SHARED_DATA 快速路径（用户态只读页，无系统调用）
+// ---------------------------------------------------------------------------
+
+/// 直接读取 KUSER_SHARED_DATA.SystemTime（0x7FFE0014）。
+/// 布局：KSYSTEM_TIME { LowPart: u32, High1Time: i32, High2Time: i32 }，
+/// 高 32 位前后两次一致才认定为一次完整的 64 位快照（内核写入的 seqlock）。
+/// 返回 100ns 为单位的 FILETIME；失败返回 0。
+pub fn timeSharedTicks() -> i64 {
+    let base: *u32 = 0x7FFE0014 as *u32;
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    var ok: bool = false;
+    var guard: u64 = 0;
+    while !ok && guard < 64 {
+        lo = base[0];
+        hi = base[1] as u32;
+        if (base[2] as u32) == hi {
+            ok = true;
+        }
+        guard = guard + 1;
+    }
+    return ((hi as u64) << 32 | (lo as u64)) as i64;
+}
+
+/// 快速路径的毫秒数（自 1601-01-01 起）
+pub fn timeSharedMillis() -> i64 {
+    return timeSharedTicks() / 10000;
+}

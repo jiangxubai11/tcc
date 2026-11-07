@@ -1,0 +1,366 @@
+// =============================================================================
+//  tclib/gfx/gl.tc — OpenGL 1.1 绑定（真正调用显卡）
+// -----------------------------------------------------------------------------
+//  为什么选 OpenGL 1.1 而不是 D3D11：
+//    · 不需要 COM vtable、不需要着色器字节码编译器
+//    · opengl32.dll 在任意 Windows 上都有
+//    · 固定管线，几十个 C 函数即可完成「变换 + 光栅化 + 深度测试」
+//
+//  关键约束（本编译器特有，必须遵守）：
+//    本编译器调用函数时，**浮点实参也走整数寄存器**（RCX/RDX/R8/R9），
+//    不走 XMM0-3。而 C 的 x64 调用约定要求 float/double 放 XMM。
+//    ⇒ 凡是参数含 float/double 的 GL 函数（glVertex3f / glRotatef / glFrustum
+//      / glClearColor / glLoadMatrix… 中的 f 版）**都不能直接调**。
+//
+//    解决办法：全部改用「整数 + 指针」形的 GL 入口：
+//      顶点/颜色 → glVertexPointer / glColorPointer（传指针）
+//      矩阵       → glLoadMatrixf / glMultMatrixf（传 float[16] 指针）
+//      绘制       → glDrawArrays / glDrawElements（全整数）
+//    这样 GPU 依然负责变换与光栅化，而调用点没有任何浮点实参。
+//
+//  用法：
+//      if !glAttach(hwnd) { ... }
+//      glBeginFrame()
+//      ... glLoadMatrixf(...) / glVertexPointer(...) / glDrawArrays(...)
+//      glPresent()
+// =============================================================================
+
+module tclib.gfx.gl
+
+import "../../tcrt/rt.tc"
+import "../../tcrt/sys/nt.tc"
+import "../win/win32.tc"
+import "../win/dload.tc"
+
+// ---------------------------------------------------------------- GL 常量
+pub const GL_COLOR_BUFFER_BIT: u32 = 0x4000
+pub const GL_DEPTH_BUFFER_BIT: u32 = 0x0100
+pub const GL_DEPTH_TEST: u32 = 0x0B71
+pub const GL_LEQUAL: u32 = 0x0203
+pub const GL_LESS: u32 = 0x0201
+pub const GL_PROJECTION: u32 = 0x1701
+pub const GL_MODELVIEW: u32 = 0x1700
+pub const GL_FLOAT: u32 = 0x1406
+pub const GL_TRIANGLES: u32 = 0x0004
+pub const GL_VERTEX_ARRAY: u32 = 0x8074
+pub const GL_COLOR_ARRAY: u32 = 0x8076
+pub const GL_CULL_FACE: u32 = 0x0B44
+pub const GL_BACK: u32 = 0x0405
+pub const GL_SMOOTH: u32 = 0x1D01
+pub const GL_NO_ERROR: u32 = 0
+
+// ---------------- 光照相关 ----------------
+pub const GL_LIGHTING: u32 = 0x0B50
+pub const GL_LIGHT0: u32 = 0x4000
+pub const GL_POSITION: u32 = 0x1203
+pub const GL_AMBIENT: u32 = 0x1200
+pub const GL_DIFFUSE: u32 = 0x1201
+pub const GL_SPECULAR: u32 = 0x1202
+pub const GL_SHININESS: u32 = 0x1601
+pub const GL_COLOR_MATERIAL: u32 = 0x0B57
+pub const GL_FRONT: u32 = 0x0404
+pub const GL_FRONT_AND_BACK: u32 = 0x0408
+pub const GL_AMBIENT_AND_DIFFUSE: u32 = 0x1602
+pub const GL_NORMALIZE: u32 = 0x0BA1
+pub const GL_LIGHT_MODEL_AMBIENT: u32 = 0x0B53
+
+/// opengl32 / gdi32 / user32 里需要的函数指针
+pub struct GlApi {
+    getDC: u64
+    choosePixelFormat: u64
+    setPixelFormat: u64
+    swapBuffers: u64
+    wglCreateContext: u64
+    wglMakeCurrent: u64
+    wglDeleteContext: u64
+    clear: u64
+    enable: u64
+    disable: u64
+    depthFunc: u64
+    viewport: u64
+    matrixMode: u64
+    loadIdentity: u64
+    loadMatrixf: u64
+    multMatrixf: u64
+    vertexPointer: u64
+    colorPointer: u64
+    enableClientState: u64
+    drawArrays: u64
+    shadeModel: u64
+    getError: u64
+    finish: u64
+    cullFace: u64
+    normalPointer: u64
+    lightfv: u64
+    lightModelfv: u64
+    materialfv: u64
+    colorMaterial: u64
+    getString: u64
+}
+
+pub var gGl: GlApi
+pub var gHdc: u64 = 0
+pub var gHglrc: u64 = 0
+pub var gGlLoaded: bool = false
+
+// ---------------------------------------------------------------- 加载
+
+/// 用 kernel32!LoadLibraryA 加载 DLL（本项目的产物导入表为空，
+/// 所以既没有静态导入、也没有现成的 LoadLibrary 绑定，只能自己解析）。
+fn 加载DLL(name: *u8) -> u64 {
+    let k32: *u8 = findModule("kernel32.dll")
+    if (k32 as u64) == 0 {
+        return 0
+    }
+    let p: u64 = peExport(k32 as u64, "LoadLibraryA")
+    if p == 0 {
+        return 0
+    }
+    let fp: fn(u64) -> u64 = p as fn(u64) -> u64
+    return fp(name as u64)
+}
+
+fn 导出(h: u64, name: *u8) -> u64 {
+    if h == 0 {
+        return 0
+    }
+    return peExport(h, name)
+}
+
+/// 解析 opengl32 / gdi32 / user32 的全部入口；可重复调用。
+pub fn glLoadAll() -> bool {
+    if gGlLoaded {
+        return true
+    }
+    let gl: u64 = 加载DLL("opengl32.dll")
+    if gl == 0 {
+        return false
+    }
+    let gd: u64 = 加载DLL("gdi32.dll")
+    let us: u64 = 加载DLL("user32.dll")
+    if gd == 0 || us == 0 {
+        return false
+    }
+
+    gGl.getDC            = 导出(us, "GetDC")
+    gGl.choosePixelFormat = 导出(gd, "ChoosePixelFormat")
+    gGl.setPixelFormat    = 导出(gd, "SetPixelFormat")
+    gGl.swapBuffers      = 导出(gd, "SwapBuffers")
+
+    gGl.wglCreateContext = 导出(gl, "wglCreateContext")
+    gGl.wglMakeCurrent   = 导出(gl, "wglMakeCurrent")
+    gGl.wglDeleteContext = 导出(gl, "wglDeleteContext")
+
+    gGl.clear            = 导出(gl, "glClear")
+    gGl.enable           = 导出(gl, "glEnable")
+    gGl.disable          = 导出(gl, "glDisable")
+    gGl.depthFunc        = 导出(gl, "glDepthFunc")
+    gGl.viewport         = 导出(gl, "glViewport")
+    gGl.matrixMode       = 导出(gl, "glMatrixMode")
+    gGl.loadIdentity     = 导出(gl, "glLoadIdentity")
+    gGl.loadMatrixf      = 导出(gl, "glLoadMatrixf")
+    gGl.multMatrixf      = 导出(gl, "glMultMatrixf")
+    gGl.vertexPointer    = 导出(gl, "glVertexPointer")
+    gGl.colorPointer     = 导出(gl, "glColorPointer")
+    gGl.enableClientState  = 导出(gl, "glEnableClientState")
+    gGl.drawArrays       = 导出(gl, "glDrawArrays")
+    gGl.shadeModel       = 导出(gl, "glShadeModel")
+    gGl.getError         = 导出(gl, "glGetError")
+    gGl.finish           = 导出(gl, "glFinish")
+    gGl.cullFace         = 导出(gl, "glCullFace")
+    gGl.normalPointer    = 导出(gl, "glNormalPointer")
+    gGl.lightfv          = 导出(gl, "glLightfv")
+    gGl.lightModelfv     = 导出(gl, "glLightModelfv")
+    gGl.materialfv       = 导出(gl, "glMaterialfv")
+    gGl.colorMaterial    = 导出(gl, "glColorMaterial")
+    gGl.getString        = 导出(gl, "glGetString")
+
+    // 缺一不可：任何一项为 0 都说明该 DLL 版本不符
+    if gGl.getDC == 0 || gGl.choosePixelFormat == 0 || gGl.setPixelFormat == 0 ||
+       gGl.swapBuffers == 0 || gGl.wglCreateContext == 0 ||
+       gGl.wglMakeCurrent == 0 || gGl.clear == 0 || gGl.enable == 0 ||
+       gGl.viewport == 0 || gGl.matrixMode == 0 || gGl.loadIdentity == 0 ||
+       gGl.loadMatrixf == 0 || gGl.vertexPointer == 0 || gGl.drawArrays == 0 {
+        return false
+    }
+    gGlLoaded = true
+    return true
+}
+
+// ---------------------------------------------------------------- 像素格式
+
+/// 填 PIXELFORMATDESCRIPTOR（44 字节，x64 布局）。
+/// 偏移：0 nSize(u16) / 2 nVersion(u16) / 4 dwFlags(u32) / 8 iPixelType /
+///       9 cColorBits / 23 cDepthBits / 24 cStencilBits / 26 cLayerType
+fn 铺像素格式(p: *u8, size: i32) -> void {
+    var i: u64 = 0
+    while i < 44 {
+        p[i] = 0
+        i = i + 1
+    }
+    p[0] = (size & 0xFF) as u8
+    p[1] = ((size >> 8) & 0xFF) as u8
+    p[2] = 1              // nVersion = 1
+    p[3] = 0
+    // dwFlags = PFD_DRAW_TO_WINDOW(0x4) | PFD_SUPPORT_OPENGL(0x20) | PFD_DOUBLEBUFFER(0x1)
+    p[4] = 0x25
+    p[5] = 0
+    p[6] = 0
+    p[7] = 0
+    p[8] = 0              // PFD_TYPE_RGBA
+    p[9] = 32             // cColorBits
+    p[23] = 24            // cDepthBits
+    p[24] = 8             // cStencilBits
+    p[26] = 0             // PFD_MAIN_PLANE
+}
+
+/// 给窗口挂上 GL 上下文。成功后可立即 draw。
+pub fn glAttach(hwnd: u64, w: i32, h: i32) -> bool {
+    if !glLoadAll() {
+        return false
+    }
+    if hwnd == 0 {
+        return false
+    }
+    gHdc = wcall1(gGl.getDC, hwnd)
+    if gHdc == 0 {
+        return false
+    }
+
+    var pfd: [44]u8
+    // 先按 44 试；若驱动不认，再按 40 试（历史实现里两种尺寸都出现过）
+    铺像素格式(&pfd[0], 44)
+    var pf: i32 = wcall2(gGl.choosePixelFormat, gHdc, &pfd[0] as u64) as i32
+    if pf == 0 {
+        铺像素格式(&pfd[0], 40)
+        pf = wcall2(gGl.choosePixelFormat, gHdc, &pfd[0] as u64) as i32
+        if pf == 0 {
+            return false
+        }
+    }
+    if wcall3(gGl.setPixelFormat, gHdc, pf as u64, &pfd[0] as u64) == 0 {
+        return false
+    }
+
+    gHglrc = wcall1(gGl.wglCreateContext, gHdc)
+    if gHglrc == 0 {
+        return false
+    }
+    if wcall2(gGl.wglMakeCurrent, gHdc, gHglrc) == 0 {
+        return false
+    }
+
+    // 初始化固定管线状态：深度测试 + 平滑着色 + 背面剔除 + 双面光照无关
+    wcall1(gGl.enable, GL_DEPTH_TEST as u64)
+    wcall1(gGl.depthFunc, GL_LEQUAL as u64)
+    wcall1(gGl.shadeModel, GL_SMOOTH as u64)
+    wcall1(gGl.enable, GL_CULL_FACE as u64)
+    wcall1(gGl.cullFace, GL_BACK as u64)
+    wcall1(gGl.enableClientState, GL_VERTEX_ARRAY as u64)
+    wcall1(gGl.enableClientState, GL_COLOR_ARRAY as u64)
+    wcall4(gGl.viewport, 0, 0, w as u64, h as u64)
+    return true
+}
+
+pub fn glDetach() -> void {
+    if gHglrc != 0 {
+        wcall2(gGl.wglMakeCurrent, 0, 0)
+        wcall1(gGl.wglDeleteContext, gHglrc)
+        gHglrc = 0
+    }
+    if gHdc != 0 {
+        gHdc = 0
+    }
+}
+
+// ---------------------------------------------------------------- 每帧
+
+/// 清屏（颜色缓冲 + 深度缓冲）。默认清屏色为黑。
+pub fn glClearAll() -> void {
+    wcall1(gGl.clear, (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT) as u64)
+}
+
+/// 把当前 GL 帧推送到窗口
+pub fn glPresent() -> void {
+    if gHdc != 0 {
+        wcall1(gGl.swapBuffers, gHdc)
+    }
+}
+
+pub fn glSetPerspective(m: *f32) -> void {
+    wcall1(gGl.matrixMode, GL_PROJECTION as u64)
+    wcall1(gGl.loadMatrixf, m as u64)
+}
+
+pub fn glSetModelView(m: *f32) -> void {
+    wcall1(gGl.matrixMode, GL_MODELVIEW as u64)
+    wcall1(gGl.loadMatrixf, m as u64)
+}
+
+pub fn glIdentity() -> void {
+    wcall0(gGl.loadIdentity)
+}
+
+/// 顶点数组：每个顶点 3 个 float，stride 为字节步长
+pub fn glVerts(ptr: *f32, stride: i32) -> void {
+    wcall4(gGl.vertexPointer, 3, GL_FLOAT as u64, stride as u64, ptr as u64)
+}
+
+/// 颜色数组：每个顶点 3 个 float
+pub fn glColors(ptr: *f32, stride: i32) -> void {
+    wcall4(gGl.colorPointer, 3, GL_FLOAT as u64, stride as u64, ptr as u64)
+}
+
+pub fn glDraw(count: i32) -> void {
+    wcall3(gGl.drawArrays, GL_TRIANGLES as u64, 0, count as u64)
+}
+
+/// 返回并清除 GL 错误码（0 = 无错）
+pub fn glTakeError() -> u32 {
+    if gGl.getError == 0 {
+        return 0
+    }
+    return wcall0(gGl.getError) as u32
+}
+
+// ---------------------------------------------------------------- 光照
+
+/// 法线数组：每顶点 3 个 float，stride 为字节步长
+pub fn glNormals(ptr: *f32, stride: i32) -> void {
+    wcall3(gGl.normalPointer, GL_FLOAT as u64, stride as u64, ptr as u64)
+}
+
+/// 打开光照并把颜色材质绑定到「环境+漫反射」，于是每顶点颜色仍能染色
+pub fn glLightingOn() -> void {
+    wcall1(gGl.enable, GL_LIGHTING as u64)
+    wcall1(gGl.enable, GL_LIGHT0 as u64)
+    wcall1(gGl.enable, GL_NORMALIZE as u64)
+    wcall1(gGl.enable, GL_COLOR_MATERIAL as u64)
+    wcall2(gGl.colorMaterial, GL_FRONT_AND_BACK as u64,
+           GL_AMBIENT_AND_DIFFUSE as u64)
+}
+
+/// 光源 0 的参数。pname 用 GL_POSITION / GL_AMBIENT / GL_DIFFUSE / GL_SPECULAR，
+/// params 指向 4 个 float。GL_POSITION 会受当前 MODELVIEW 影响，
+/// 所以**必须在单位矩阵状态下调用**（挂上上下文后立刻设）。
+pub fn glLight0(pname: u32, params: *f32) -> void {
+    wcall3(gGl.lightfv, GL_LIGHT0 as u64, pname as u64, params as u64)
+}
+
+/// 全局环境光（场景整体亮度）
+pub fn glLightModelAmbient(params: *f32) -> void {
+    wcall2(gGl.lightModelfv, GL_LIGHT_MODEL_AMBIENT as u64, params as u64)
+}
+
+/// 材质参数（GL_SPECULAR / GL_SHININESS 等），params 指向 4 个 float
+pub fn glMaterial(pname: u32, params: *f32) -> void {
+    wcall3(gGl.materialfv, GL_FRONT_AND_BACK as u64, pname as u64, params as u64)
+}
+
+/// 取 GL 版本字符串（诊断用）
+pub fn glVersion() -> *u8 {
+    if gGl.getString == 0 {
+        return null
+    }
+    return wcall1(gGl.getString, 0x1F02) as *u8
+}

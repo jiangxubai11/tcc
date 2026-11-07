@@ -1,0 +1,90 @@
+// =============================================================================
+//  examples/39_dx/clear.tc — D3D11 最小验证：设备 + 交换链 + 清屏 + Present
+// -----------------------------------------------------------------------------
+//  这一步不画几何体，只让整个窗口颜色持续变化。
+//  颜色在变 = D3D11 设备真的在跑 + 交换链真的在 Present = 显卡在干活。
+//
+//  编译：
+//      build\tcc3.exe examples\39_dx\clear.tc -o examples\39_dx\clear.exe
+//  运行：窗口颜色循环变化；ESC 或关窗口退出。
+//  诊断：同目录 dx.log 记录每一步，崩了就看最后一行。
+// =============================================================================
+
+module dx_clear
+
+import "tcrt/rt.tc"
+import "tclib/win/win32.tc"
+import "tclib/gfx/dx11.tc"
+
+var gRun: bool = true
+var gDx: Dx11
+
+fn 过程(h: u64, msg: u32, wp: u64, lp: i64) -> i64 {
+    if msg == 0x0010 {          // WM_CLOSE
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    if msg == 0x0002 {          // WM_DESTROY
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    return wcall4(gWin.defWindowProcW, h, msg as u64, wp, lp as u64) as i64
+}
+
+fn main() -> i32 {
+    if !rtInit() {
+        return 1
+    }
+    if !winInit() {
+        rtPrint("[FAIL] winInit\n")
+        return 2
+    }
+    dxLogOpen()
+    dxLog("进入 main")
+
+    if !winRegisterClassEx("DXClear", 过程, 0, 0x00000000) {
+        dxLog("失败: 注册窗口类")
+        rtPrint("[FAIL] 注册窗口类失败\n")
+        return 4
+    }
+    let w: i32 = 720
+    let h: i32 = 560
+    let hwnd: u64 = winCreateWindowFramed("DXClear", "D3D11 最小验证（颜色循环）", w, h)
+    if hwnd == 0 {
+        dxLog("失败: 创建窗口")
+        rtPrint("[FAIL] 创建窗口失败\n")
+        return 5
+    }
+    winShow(hwnd, SW_SHOW)
+    dxLog("窗口已显示")
+
+    if !dxCreate(&gDx, hwnd, w, h) {
+        rtPrint("[FAIL] D3D11 初始化失败 —— 看同目录 dx.log 的最后一行\n")
+        return 6
+    }
+    rtPrint("[OK] D3D11 设备已创建\n")
+
+    var t: f64 = 0.0
+    var c: [4]f32
+    while winPump() && gRun {
+        if keyDown(27) {
+            break
+        }
+        c[0] = (0.5 + 0.5 * sin(t)) as f32
+        c[1] = (0.5 + 0.5 * sin(t + 2.0943951)) as f32
+        c[2] = (0.5 + 0.5 * sin(t + 4.1887902)) as f32
+        c[3] = 1.0 as f32
+        dxClearColor(&gDx, &c[0])
+        dxPresent(&gDx)
+        t = t + 0.03
+        winSleep(16)
+    }
+
+    dxLog("退出消息循环")
+    dxDestroy(&gDx)
+    dxLog("资源已释放")
+    dxLogClose()
+    return 0
+}

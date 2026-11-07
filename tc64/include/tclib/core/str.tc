@@ -1,0 +1,175 @@
+// =============================================================================
+//  tclib/core/str.tc — 动态字符串 Str
+// -----------------------------------------------------------------------------
+//  始终维护结尾 NUL，使 `strCStr` 可直接返回 `data`（零拷贝、C 字符串互操作）。
+//  扩容同样走区块递增分配器。
+// =============================================================================
+
+module tc.core.str;
+
+import "../../tcrt/core/mem.tc";
+
+pub struct Str {
+    data: *u8;
+    len: u64;      // 不含结尾 NUL
+    cap: u64;      // data 的容量（含 1 字节 NUL 预留）
+}
+
+/// 空字符串
+pub fn strNew() -> Str {
+    var s: Str;
+    s.data = null;
+    s.len = 0;
+    s.cap = 0;
+    return s;
+}
+
+pub fn strLen(s: *Str) -> u64 {
+    return s->len;
+}
+
+/// 以 NUL 结尾的 C 字符串视图（零拷贝，只要不再写就有效）
+pub fn strCStr(s: *Str) -> *u8 {
+    if (s->data as u64) == 0 {
+        return "";
+    }
+    return s->data;
+}
+
+fn strGrow(s: *Str, need: u64) -> bool {
+    var ncap: u64 = 16;
+    if s->cap > 0 {
+        ncap = s->cap * 2;
+    }
+    while ncap < need {
+        ncap = ncap * 2;
+    }
+    let nd: *u8 = rtAlloc(ncap, 16);
+    if (nd as u64) == 0 {
+        return false;
+    }
+    if s->len > 0 {
+        rtMemCopy(nd, s->data, s->len);
+    }
+    s->data = nd;
+    s->cap = ncap;
+    s->data[s->len] = 0;
+    return true;
+}
+
+/// 追加一个字节
+pub fn strPush(s: *Str, c: u8) -> void {
+    if s->len + 2 > s->cap {
+        if !strGrow(s, s->len + 2) {
+            return;
+        }
+    }
+    s->data[s->len] = c;
+    s->len = s->len + 1;
+    s->data[s->len] = 0;
+}
+
+/// 追加 n 个字节
+pub fn strAppendN(s: *Str, p: *u8, n: u64) -> void {
+    if n == 0 {
+        return;
+    }
+    if s->len + n + 1 > s->cap {
+        if !strGrow(s, s->len + n + 1) {
+            return;
+        }
+    }
+    rtMemCopy(s->data + s->len, p, n);
+    s->len = s->len + n;
+    s->data[s->len] = 0;
+}
+
+/// 追加一个 NUL 结尾的 C 字符串
+pub fn strAppendC(s: *Str, cstr: *u8) -> void {
+    var n: u64 = 0;
+    while cstr[n] != 0 {
+        n = n + 1;
+    }
+    strAppendN(s, cstr, n);
+}
+
+/// 追加另一个 Str
+pub fn strAppendStr(s: *Str, o: *Str) -> void {
+    if o->len > 0 {
+        strAppendN(s, o->data, o->len);
+    }
+}
+
+/// 从 C 字符串构造
+pub fn strFromC(cstr: *u8) -> Str {
+    var s: Str = strNew();
+    strAppendC(&s, cstr);
+    return s;
+}
+
+/// 追加无符号十进制
+pub fn strAppendU64(s: *Str, v: u64) -> void {
+    var buf: [24]u8;
+    var n: u64 = 0;
+    var x: u64 = v;
+    if x == 0 {
+        buf[0] = 48;
+        n = 1;
+    } else {
+        while x > 0 {
+            buf[n] = (48 + (x % 10)) as u8;
+            x = x / 10;
+            n = n + 1;
+        }
+    }
+    var j: u64 = n;
+    while j > 0 {
+        j = j - 1;
+        strPush(s, buf[j]);
+    }
+}
+
+/// 追加有符号十进制
+pub fn strAppendI64(s: *Str, v: i64) -> void {
+    if v < 0 {
+        strPush(s, 45);
+        strAppendU64(s, 0 - (v as u64));
+        return;
+    }
+    strAppendU64(s, v as u64);
+}
+
+/// 追加定宽十六进制（大写）
+pub fn strAppendHex(s: *Str, v: u64, width: u64) -> void {
+    var i: u64 = 0;
+    while i < width && i < 16 {
+        let shift: u64 = (width - 1 - i) * 4;
+        let d: u64 = (v >> shift) & 0xF;
+        if d < 10 {
+            strPush(s, (48 + d) as u8);
+        } else {
+            strPush(s, (55 + d) as u8);
+        }
+        i = i + 1;
+    }
+}
+
+/// 相等比较
+pub fn strEq(a: *Str, b: *Str) -> bool {
+    if a->len != b->len {
+        return false;
+    }
+    return rtMemCompare(a->data, b->data, a->len) == 0;
+}
+
+/// 与 C 字符串比较
+pub fn strEqC(a: *Str, cstr: *u8) -> bool {
+    var i: u64 = 0;
+    while i < a->len && cstr[i] != 0 {
+        if a->data[i] != cstr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return i == a->len && cstr[i] == 0;
+}

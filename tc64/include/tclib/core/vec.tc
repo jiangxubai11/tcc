@@ -1,0 +1,108 @@
+// =============================================================================
+//  tclib/core/vec.tc — 泛型动态数组 Vec<T>
+// -----------------------------------------------------------------------------
+//  基于运行时的区块递增分配器（region 语义）：扩容旧块不归还，由区域整体回收。
+//  单态化保证零装箱、零类型擦除 —— Vec<i64> 与 C 的 i64[] 性能一致。
+// =============================================================================
+
+module tc.core.vec;
+
+import "../../tcrt/core/mem.tc";
+
+pub struct Vec<T> {
+    data: *T;
+    len: u64;
+    cap: u64;
+}
+
+/// 空向量
+pub fn vecNew<T>() -> Vec<T> {
+    var v: Vec<T>;
+    v.data = null;
+    v.len = 0;
+    v.cap = 0;
+    return v;
+}
+
+/// 预留容量的空向量
+pub fn vecWithCap<T>(cap: u64) -> Vec<T> {
+    var v: Vec<T>;
+    if cap == 0 {
+        v.data = null;
+        v.len = 0;
+        v.cap = 0;
+        return v;
+    }
+    let bytes: u64 = cap * (sizeof(T) as u64);
+    v.data = rtAlloc(bytes, 16) as *T;
+    v.len = 0;
+    v.cap = cap;
+    return v;
+}
+
+pub fn vecLen<T>(v: *Vec<T>) -> u64 {
+    return v->len;
+}
+
+pub fn vecCap<T>(v: *Vec<T>) -> u64 {
+    return v->cap;
+}
+
+/// 读取下标（不做边界检查，与 C 一致）
+pub fn vecGet<T>(v: *Vec<T>, i: u64) -> T {
+    return v->data[i];
+}
+
+/// 写入下标
+pub fn vecSet<T>(v: *Vec<T>, i: u64, x: T) -> void {
+    v->data[i] = x;
+}
+
+/// 追加元素；容量不足时按 2 倍扩容
+pub fn vecPush<T>(v: *Vec<T>, x: T) -> void {
+    if v->len == v->cap {
+        var ncap: u64 = 8;
+        if v->cap > 0 {
+            ncap = v->cap * 2;
+        }
+        let bytes: u64 = ncap * (sizeof(T) as u64);
+        let nd: *T = rtAlloc(bytes, 16) as *T;
+        if (nd as u64) == 0 {
+            return;
+        }
+        // 搬迁旧数据（按字节，等价于逐元素拷贝）
+        if v->len > 0 {
+            rtMemCopy(nd as *u8, v->data as *u8, v->len * (sizeof(T) as u64));
+        }
+        v->data = nd;
+        v->cap = ncap;
+    }
+    v->data[v->len] = x;
+    v->len = v->len + 1;
+}
+
+/// 弹出并返回末尾元素；空向量时行为未定义
+pub fn vecPop<T>(v: *Vec<T>) -> T {
+    v->len = v->len - 1;
+    return v->data[v->len];
+}
+
+/// 末尾元素的指针
+pub fn vecLast<T>(v: *Vec<T>) -> *T {
+    return v->data + (v->len - 1);
+}
+
+/// 清空（保留已分配容量）
+pub fn vecClear<T>(v: *Vec<T>) -> void {
+    v->len = 0;
+}
+
+/// 底层指针（便于与 C 风格代码 / slice 互操作）
+pub fn vecData<T>(v: *Vec<T>) -> *T {
+    return v->data;
+}
+
+/// 切片视图（不拥有内存）
+pub fn vecSlice<T>(v: *Vec<T>) -> []T {
+    return slice(v->data, v->len);
+}

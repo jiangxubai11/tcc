@@ -1,0 +1,347 @@
+// 动态加载器 —— 路线 B（真 DLL）的地基
+//
+// TC 的产物导入表为空、不依赖任何系统 DLL，所以"加载 DLL"这件事
+// 也不能靠 LoadLibrary / GetProcAddress。这里自己做 PE 解析：
+//
+//   · peExport(已加载模块基址, 函数名) -> 函数地址
+//       解析 PE32+ 头的 DataDirectory[0]（导出目录），
+//       按名字表查到序号，再由序号取函数 RVA，最后 base + RVA。
+//       这一步对「已经在内存里的模块」就够用（系统 DLL 也能查）。
+//
+//   · peImageSize / peMapSections 等文件映射部分见下方（供后续 dlOpen 使用）
+//
+// 说明：TC 用 -dll 产出的模块代码全程 RIP 相对、无 .reloc、导入表为空，
+// 因此可以映射到任意基址，不需要重定位处理。
+module tclib.win.dload;
+
+import "../../tcrt/rt.tc";
+import "../../tcrt/sys/nt.tc";
+
+/// ASCII 字符串相等（到 NUL 为止）
+fn strEq(a: *u8, b: *u8) -> bool {
+    var i: u64 = 0;
+    while true {
+        if a[i] != b[i] {
+            return false;
+        }
+        if a[i] == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 读 PE 头里的 e_lfanew（DOS 头 +0x3C）
+fn peNtOffset(base: *u8) -> u64 {
+    return *((base + 60) as *u32) as u64;
+}
+
+/// 是否 PE32+（x64）
+pub fn peIsX64(base: *u8) -> bool {
+    let nt: *u8 = base + peNtOffset(base);
+    let magic: u16 = *((nt + 24) as *u16);
+    return magic == 0x20B;
+}
+
+/// 在已加载模块的导出表里按名字查函数地址；找不到返回 0。
+/// hmod 可以是 findModule("ntdll.dll") 得到的基址。
+pub fn peExport(hmod: u64, name: *u8) -> u64 {
+    if hmod == 0 {
+        return 0;
+    }
+    let base: *u8 = hmod as *u8;
+    if !peIsX64(base) {
+        return 0;
+    }
+
+    let opt: *u8 = base + peNtOffset(base) + 24;      // 可选头起始
+    let expRva: u32 = *((opt + 112) as *u32);         // DataDirectory[0].VirtualAddress
+    if expRva == 0 {
+        return 0;
+    }
+
+    let exp: *u8 = base + (expRva as u64);
+    let funcsRva: u32 = *((exp + 28) as *u32);        // AddressOfFunctions
+    let namesRva: u32 = *((exp + 32) as *u32);        // AddressOfNames
+    let ordsRva: u32 = *((exp + 36) as *u32);         // AddressOfNameOrdinals
+    let numNames: u32 = *((exp + 24) as *u32);        // NumberOfNames
+
+    var i: u32 = 0;
+    while i < numNames {
+        let nameRva: u32 = *((base + (namesRva as u64) + (i as u64) * 4) as *u32);
+        let s: *u8 = base + (nameRva as u64);
+        if strEq(s, name) {
+            let ord: u16 = *((base + (ordsRva as u64) + (i as u64) * 2) as *u16);
+            let fnRva: u32 = *((base + (funcsRva as u64) + (ord as u64) * 4) as *u32);
+            if fnRva == 0 {
+                return 0;
+            }
+            return (base + (fnRva as u64)) as u64;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// 把 DLL 文件映射进内存，返回映像基址；失败返回 0。
+///
+/// 只用系统调用申请可执行内存，不依赖任何静态导入（也就没有 LoadLibrary）。
+/// 仅支持「无重定位、无导入表」的模块 —— TC 用 -dll 产出的正是这种：
+/// 代码全程 RIP 相对，所以映射到任意基址都不需要修地址。
+pub fn dlOpen(path: *u8) -> u64 {
+    let f: File = rtFileOpen(path);
+    if !f.ok {
+        return 0;
+    }
+    let n: u64 = rtFileSize(&f);
+    if n < 0x200 {
+        rtFileClose(&f);
+        return 0;
+    }
+    let buf: *u8 = rtAlloc(n + 1, 16) as *u8;
+    rtFileRead(&f, buf, n);
+    rtFileClose(&f);
+
+    if !peIsX64(buf) {
+        return 0;
+    }
+    let imgSize: u32 = peImageSize(buf);
+    if imgSize == 0 {
+        return 0;
+    }
+
+    // 申请可执行内存
+    var mem: u64 = 0;
+    var msz: u64 = imgSize as u64;
+    let st: i64 = syscall(gNt.allocateVirtualMemory as u64,
+                          CURRENT_PROCESS,
+                          &mem as u64,
+                          0,
+                          &msz as u64,
+                          (MEM_COMMIT | MEM_RESERVE) as u64,
+                          PAGE_EXECUTE_READWRITE as u64);
+    if st < 0 || mem == 0 {
+        return 0;
+    }
+
+    // 1) 复制头部（SizeOfHeaders 位于可选头 +60）
+    let opt: *u8 = buf + peNtOffset(buf) + 24;
+    let hdr: u32 = *((opt + 60) as *u32);
+    var i: u64 = 0;
+    while i < (hdr as u64) && i < n {
+        *((mem + i) as *u8) = buf[i];
+        i = i + 1;
+    }
+
+    // 2) 逐节复制：文件偏移 Raw → 内存 RVA
+    let nsec: u16 = peSectionCount(buf);
+    var s: u16 = 0;
+    while s < nsec {
+        let rva: u32 = peSectionRva(buf, s);
+        let raw: u32 = peSectionRaw(buf, s);
+        let rsz: u32 = peSectionRawSize(buf, s);
+        var k: u64 = 0;
+        while k < (rsz as u64) && (raw as u64) + k < n {
+            *((mem + (rva as u64) + k) as *u8) = buf[(raw as u64) + k];
+            k = k + 1;
+        }
+        s = (s + 1) as u16;
+    }
+
+    // 3) 需要重定位或导入解析的模块一律拒绝 —— 宁可明确失败，
+    //    也不要把一个"看起来加载成功"的坏映像返回给调用方。
+    let impRva: u32 = *((opt + 120) as *u32);       // DataDirectory[1]
+    let relocRva: u32 = *((opt + 152) as *u32);     // DataDirectory[5]
+    if impRva != 0 || relocRva != 0 {
+        return 0;
+    }
+
+    return mem;
+}
+
+// ---------------------------------------------------------------------------
+//  就近查找：让程序能找到自己旁边 / 工具链里的 DLL
+// ---------------------------------------------------------------------------
+
+fn str2(dst: *u8, a: *u8, b: *u8) -> void {
+    var w: u64 = 0;
+    var i: u64 = 0;
+    while a[i] != 0 && w < 500 {
+        dst[w] = a[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while b[i] != 0 && w < 500 {
+        dst[w] = b[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    dst[w] = 0;
+}
+
+fn exists2(p: *u8) -> bool {
+    let f: File = rtFileOpen(p);
+    if !f.ok {
+        return false;
+    }
+    rtFileClose(&f);
+    return true;
+}
+
+/// 取当前 exe 所在目录（PEB → ProcessParameters.ImagePathName）
+fn exeDirOf(out: *u8) -> bool {
+    let peb: *u8 = read_gs(0x60) as *u8;
+    if (peb as u64) == 0 {
+        return false;
+    }
+    let pp: *u8 = (*((peb + 0x20) as *u64)) as *u8;
+    if (pp as u64) == 0 {
+        return false;
+    }
+    let ilen: u16 = *((pp + 0x60) as *u16);
+    if ilen == 0 {
+        return false;
+    }
+    let ibuf: *u16 = (*((pp + 0x68) as *u64)) as *u16;
+    if (ibuf as u64) == 0 {
+        return false;
+    }
+    var n: u64 = (ilen as u64) / 2;
+    var w: u64 = 0;
+    var lastSep: u64 = 0;
+    var i: u64 = 0;
+    while i < n && w < 500 {
+        let ch: u16 = ibuf[i];
+        if ch >= 128 {
+            break;
+        }
+        out[w] = ch as u8;
+        if ch == 92 || ch == 47 {
+            lastSep = w;
+        }
+        w = w + 1;
+        i = i + 1;
+    }
+    out[lastSep] = 0;
+    return true;
+}
+
+/// 按「exe 同目录 → ..\lib → ..\bin」的顺序找 DLL 并映射。
+/// 与 dlOpen 的差别只在"自己找路径"：找不到返回 0，不会去碰系统目录。
+pub fn dlOpenNear(name: *u8) -> u64 {
+    if exists2(name) {
+        return dlOpen(name);
+    }
+    var dir: [512]u8;
+    if !exeDirOf(&dir[0]) {
+        return 0;
+    }
+    var sep: [4]u8;
+    sep[0] = 92;
+    sep[1] = 0;
+
+    // 1) exe 同目录
+    var d1: [512]u8;
+    str2(&d1[0], &dir[0], &sep[0]);
+    var p1: [512]u8;
+    str2(&p1[0], &d1[0], name);
+    if exists2(&p1[0]) {
+        return dlOpen(&p1[0]);
+    }
+
+    // 2) <dir>\..\lib\<name>
+    var up: [512]u8;
+    str2(&up[0], &dir[0], &sep[0]);
+    var up2: [512]u8;
+    str2(&up2[0], &up[0], "..");
+    var s2: [512]u8;
+    str2(&s2[0], &up2[0], &sep[0]);
+    var s3: [512]u8;
+    str2(&s3[0], &s2[0], "lib");
+    var s4: [512]u8;
+    str2(&s4[0], &s3[0], &sep[0]);
+    var p2: [512]u8;
+    str2(&p2[0], &s4[0], name);
+    if exists2(&p2[0]) {
+        return dlOpen(&p2[0]);
+    }
+
+    // 3) <dir>\..\bin\<name>
+    var b3: [512]u8;
+    str2(&b3[0], &s2[0], "bin");
+    var b4: [512]u8;
+    str2(&b4[0], &b3[0], &sep[0]);
+    var p3: [512]u8;
+    str2(&p3[0], &b4[0], name);
+    if exists2(&p3[0]) {
+        return dlOpen(&p3[0]);
+    }
+    return 0;
+}
+
+/// 该地址是否落在模块内（用于校验解析结果合理性）
+pub fn peContains(hmod: u64, p: u64) -> bool {
+    if hmod == 0 || p == 0 || p < hmod {
+        return false;
+    }
+    let base: *u8 = hmod as *u8;
+    let opt: *u8 = base + peNtOffset(base) + 24;
+    let imageSize: u32 = *((opt + 56) as *u32);       // SizeOfImage
+    return p < hmod + (imageSize as u64);
+}
+
+/// 可选头 SizeOfImage（映射需要的总大小）
+pub fn peImageSize(base: *u8) -> u32 {
+    let opt: *u8 = base + peNtOffset(base) + 24;
+    return *((opt + 56) as *u32);
+}
+
+/// 节表项数
+pub fn peSectionCount(base: *u8) -> u16 {
+    let nt: *u8 = base + peNtOffset(base);
+    return *((nt + 6) as *u16);                      // FileHeader.NumberOfSections
+}
+
+/// 可选头 SizeOfOptionalHeader（节表起始 = NT + 24 + 该值）
+pub fn peOptSize(base: *u8) -> u16 {
+    let nt: *u8 = base + peNtOffset(base);
+    return *((nt + 20) as *u16);
+}
+
+/// 第 i 个节的 VirtualAddress
+pub fn peSectionRva(base: *u8, i: u16) -> u32 {
+    let sec: *u8 = base + peNtOffset(base) + 24 + (peOptSize(base) as u64) + (i as u64) * 40;
+    return *((sec + 12) as *u32);
+}
+
+/// 第 i 个节的 VirtualSize
+pub fn peSectionVSize(base: *u8, i: u16) -> u32 {
+    let sec: *u8 = base + peNtOffset(base) + 24 + (peOptSize(base) as u64) + (i as u64) * 40;
+    return *((sec + 8) as *u32);
+}
+
+/// 第 i 个节的 PointerToRawData（文件内偏移）
+pub fn peSectionRaw(base: *u8, i: u16) -> u32 {
+    let sec: *u8 = base + peNtOffset(base) + 24 + (peOptSize(base) as u64) + (i as u64) * 40;
+    return *((sec + 20) as *u32);
+}
+
+/// 第 i 个节的 SizeOfRawData
+pub fn peSectionRawSize(base: *u8, i: u16) -> u32 {
+    let sec: *u8 = base + peNtOffset(base) + 24 + (peOptSize(base) as u64) + (i as u64) * 40;
+    return *((sec + 16) as *u32);
+}
+
+/// 可选头 ImageBase（PE32+ 是 +24 的 u64）
+pub fn peImageBase(base: *u8) -> u64 {
+    let opt: *u8 = base + peNtOffset(base) + 24;
+    return *((opt + 24) as *u64);
+}
+
+/// 可选头 AddressOfEntryPoint
+pub fn peEntryRva(base: *u8) -> u32 {
+    let opt: *u8 = base + peNtOffset(base) + 24;
+    return *((opt + 16) as *u32);
+}

@@ -1,0 +1,113 @@
+// =============================================================================
+//  examples/39_dx/tri2.tc — 顶点缓冲最简用例（窗口先显示，失败原因写在标题栏）
+// -----------------------------------------------------------------------------
+//  预期：深蓝背景 + 橙黄大三角形。
+//  失败时窗口照样存在，标题栏显示 "FAIL n=<码>"：
+//      1 = 顶点着色器编译失败
+//      2 = 像素着色器编译失败
+//      3 = 着色器对象创建失败
+//      4 = 输入布局创建失败
+//      5 = 顶点缓冲创建失败
+//
+//  编译：build\tcc3.exe examples\39_dx\tri2.tc -o examples\39_dx\tri2.exe
+// =============================================================================
+
+module dx_tri2
+
+import "tcrt/rt.tc"
+import "tclib/win/win32.tc"
+import "tclib/gfx/dx11.tc"
+
+var gRun: bool = true
+var gDx: Dx11
+var gGeom: Geom
+
+fn 过程(h: u64, msg: u32, wp: u64, lp: i64) -> i64 {
+    if msg == 0x0010 {
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    if msg == 0x0002 {
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    return wcall4(gWin.defWindowProcW, h, msg as u64, wp, lp as u64) as i64
+}
+
+fn main() -> i32 {
+    if !rtInit() {
+        return 1
+    }
+    if !winInit() {
+        return 2
+    }
+    dxLogOpen()
+
+    if !winRegisterClassEx("DXTri2", 过程, 0, 0x00000000) {
+        dxLog("失败: 注册窗口类")
+        return 4
+    }
+    let w: i32 = 640
+    let h: i32 = 480
+    let hwnd: u64 = winCreateWindowFramed("DXTri2", "初始化中…", w, h)
+    if hwnd == 0 {
+        dxLog("失败: 创建窗口")
+        return 5
+    }
+
+    // 先显示窗口：这样任何后续失败都还能看到窗口和标题栏
+    winShow(hwnd, SW_SHOW)
+    winSetTitle(hwnd, "S1 窗口已创建")
+
+    if !dxCreate(&gDx, hwnd, w, h) {
+        winSetTitle(hwnd, "FAIL dxCreate")
+        return 6
+    }
+    winSetTitle(hwnd, "S2 D3D11 设备就绪")
+
+    let r: i32 = dxMakeVBTri(&gDx, &gGeom)
+    if r != 0 {
+        if r == 1 {
+            winSetTitle(hwnd, "FAIL n=1 VS编译")
+        } elif r == 2 {
+            winSetTitle(hwnd, "FAIL n=2 PS编译")
+        } elif r == 3 {
+            winSetTitle(hwnd, "FAIL n=3 着色器对象")
+        } elif r == 4 {
+            winSetTitle(hwnd, "FAIL n=4 输入布局")
+        } else {
+            winSetTitle(hwnd, "FAIL n=5 顶点缓冲")
+        }
+        return 7
+    }
+    winSetTitle(hwnd, "S3 就绪：应有橙黄三角形")
+    rtPrint("[OK] 顶点缓冲三角形已就绪\n")
+
+    var bg: [4]f32
+    bg[0] = 0.10 as f32
+    bg[1] = 0.10 as f32
+    bg[2] = 0.18 as f32
+    bg[3] = 1.0 as f32
+
+    var frame: i32 = 0
+    while winPump() && gRun {
+        if keyDown(27) {
+            break
+        }
+        dxClearColor(&gDx, &bg[0])
+        dxDrawVBTri(&gDx, &gGeom)
+        dxPresent(&gDx)
+        if frame == 30 {
+            winSetTitle(hwnd, "S4 已连续绘制 30 帧")
+        }
+        frame = frame + 1
+        winSleep(16)
+    }
+
+    dxDestroyGeom(&gGeom)
+    dxDestroy(&gDx)
+    dxLogClose()
+    return 0
+}

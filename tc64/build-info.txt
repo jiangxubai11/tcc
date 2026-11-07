@@ -1,0 +1,518 @@
+TC64 工具链 — 构建信息
+======================================================================
+
+版本        0.1.0
+构建日期    2026-11-06
+构建主机    Windows x86_64（真机）
+编译器来源  build\c1.exe（tools\selfhost2.cmd 第 1 阶段产物，由新语法源码编出）
+自举状态    c2 == c3（三代链的不动点，两者逐字节相同）
+            源码已全部迁到新语法（阶段 6 完成）；Stage-0 只认旧语法，已退出链条
+SHA256      9d8ae93ce3f3b8f1b0b66f0053a784ed7786257020cbd3771ca0ab51bd5a502b
+            对应 build\c2.exe == build\c3.exe
+
+产物实测（2026-11-06，新语法源码）
+  编译单元    16 个文件（9 个 tcc\*.tc + 7 个 tcrt/tclib）
+  TC64 工具链  bin\ 下已产出 8 个工具（源码在 tc\tools\tc64\，全部纯 TC 实现、零外部依赖）：
+                 tc-size.exe     PE 段大小（.text/.rdata/.data 的 raw/virt 字节数）
+                 tc-strings.exe  可打印 ASCII 串提取（min-len 可调，默认 4）
+                 tc-hash.exe     SHA-256 摘要（与 certutil 输出逐位一致）
+                 tc-objdump.exe  .text 反汇编（覆盖 push/pop、mov imm64、mov r/m、
+                                 lea、add/sub/and/or/xor/cmp、test、imul、shift、
+                                 jcc、setcc、movzx、call/jmp、ret/leave/int3、
+                                 FF group5；不认识的 opcode 输出 db 0xXX 并前进
+                                 1 字节，永不死循环）
+                 tc-dump.exe     十六进制 + ASCII 转储（每行 1..64 字节，默认 16）
+                 tc-peinfo.exe   PE 头全字段（DOS / COFF / Optional / 各节）
+                tc-coffdump.exe COFF 目标文件（节 / 符号 / 重定位，用于验证 tc -c）
+                tc-ld.exe       COFF → PE32+ 链接器（拼接节、解析符号、应用 REL32）
+               构建：tools\build_tc64_tools.cmd（用 build\c2.exe 编译）
+               自检：tc-size 报 39,424 字节、tc-hash 自算 aedc4dea…、
+                     tc-strings 扫出 97 条串、tc-objdump 解出函数序言、
+                     tc-dump 正确转储 tc.conf（UTF-8 中文字节以 . 表示）、
+                     tc-peinfo 报 ImageBase=0x140000000、Subsystem=3(console)、
+                     .text RVA=0x1000 RawPtr=0x200 SizeOfRawData=0x8c00。
+               注意：const 不支持数组字面量（且尾逗号会触发"期望 ']'"），
+                     常量表要用 `var KSHA: [64]u32 = [...]`（M5.5 全局数组字面量）。
+                     另外 opcode 分支里的 u8 局部变量必须写成 i32：TC 的整数提升
+                     会让 `(m >> 3) & 7` 变成 i32，直接赋给 u8 会报"变量初值类型不匹配"。
+  一次误判的排查（hexU64 显示 bug，非编译器问题）
+               现象：tc-objdump 的地址在 sub rsp,imm32 之后从 0x100c 跳到 0x10103；
+               .text 的 rva 显示成 0x1000000（真实是 0x1000）。一度怀疑「函数
+               调用破坏了调用者的 u64 局部变量」——因为 textRva / n 的值看起来
+               在调用 hexU64 之后变了，甚至专门写了最小用例去验证栈帧。
+               真相：hexU64 写成了 `hexByte((v >> (i*4)) & 15)` —— 每次只取
+               4 位，却交给 hexByte（它输出 2 个字符），输出整体左移 4 位：
+               0x1000 → 0000000001000000、0x1013 → 0000000001000103。
+               改成 `hexByte((v >> (i*8)) & 255)` 后地址完全连续，编译器无 bug。
+               教训：十六进制打印时，取值位宽必须与输出字符数匹配；
+                     排查「值被移位」类现象时，先怀疑打印代码本身。
+  声明函数    442（含模块隔离、类型限定名、泛型推断、代码生成优化）
+  产物大小    build\c2.exe = build\c3.exe = 1,510,400 字节（逐字节相同）
+  导入表      空 —— 零外部依赖，不链接任何系统 DLL
+  （原先那张 .text/.rdata/.bss 分节表来自 Stage-0 的 verbose 输出。Stage-0
+    现在读不懂新语法源码，无法再产出这些数字，故不保留无法复验的旧值。）
+
+语言状态
+  旧语法          fn 声明、花括号块、分号结尾 —— 永久保留，一个字节未改
+  新语法（已恢复）def 等价 fn；# 行注释（行首/行尾）；换行即语句结束（分号可省）；
+                  缩进块（行尾 ':' + INDENT/DEDENT，支持嵌套与多层回退）
+  实现方式        词法器补虚拟分号与 INDENT/DEDENT，语法器只改 parseBlock 一处，
+                  因此旧源码零影响；三批各自通过自举不动点验证
+  声明体（新增）  struct / enum / union / switch 也支持 ':' + 缩进块。
+                  语句体与声明体共用 enterDeclBody / declBodyEnd / leaveDeclBody，
+                  新旧写法可在同一文件混用；enum 的「: 基础类型」与「: 缩进体」
+                  靠冒号后是否为 INDENT 区分（行尾冒号才会产出 INDENT，无歧义）
+  局部变量        x = 6 免声明（类型由右值推断；查不到才当新声明，
+                  局部/全局/函数名三重排除，避免把全局量误判成新局部）
+  跨行表达式      行首以 && / || 起头时，上一行不补虚拟分号
+  泛型推断（新增）  maxOf(3, 7) / deref1(&v) 免 turbofish：由实参类型做结构化
+                  统合得出类型实参（支持 T / *T / []T / [N]T）；只有推断失败
+                  才报错并提示显式写 name::<T>(...)。turbofish 写法仍完全可用。
+
+代码生成优化（新增，2026-11-06）
+  立即数窥孔      x op 常量 直接生成 "rax op= imm32"，省掉右操作数求值、
+                  push/pop 与 rcx 转存。覆盖 + - & | ^ * << >> 与六种比较。
+                  实测 bench_loop（2000 万次循环，20 次取总）58ms → 50ms（+14%）。
+  泛型实例缓存    实例查找由「线性扫描函数表」改为「哈希键 O(1) 命中 + 冲突验证」。
+                  实测编译 tcc_main.tc 86ms → 84ms（约 2%）—— 说明实例查找原先
+                  并不是瓶颈（函数表仅 400 余项），收益有限但复杂度更低。
+  自举判据调整    改了代码生成后，c1（旧代码生成器产出）与 c2（新逻辑产出）
+                  必然不同；不动点改为 c2 == c3，与 GCC/Clang 的两阶段收敛一致。
+  局部变量寄存器提升
+                  函数内前 4 个「8 字节、非浮点、非聚合、未取址、非按引用」的
+                  局部变量放进 r12-r15：读直接 mov rax,reg，写直接 mov reg,rax，
+                  序言 push / 尾声 lea rsp,[rbp-32] + pop。取址（&x）的变量不提升。
+                  Sema 侧把局部变量起始 offset 抬到 64，避开 [rbp-8]..[rbp-32]
+                  的保存区。实测 bench_loop（2000 万次循环，20 次取总）：
+                  58ms → 50ms（立即数窥孔）→ **27.5ms**（再加寄存器提升），
+                  累计约 2.1 倍。产物同时缩小约 20 KB。
+  常量折叠        genBinary 入口：两个字面量的 + - * & | ^ 直接在编译期算好，
+                  只发一条 mov reg, imm64。对常量密集代码有效；bench_loop
+                  不含字面量表达式，故实测无变化。
+  赋值定向发射     genAssign 的 Assign 分支：若目标是被提升的局部变量且 rhs 可定向，
+                  直接把 rhs 算到目标寄存器。bench_loop 的 acc = acc + i*3 - 7
+                  从 9 条指令降到 4 条；配合 genExprInto 对「dst 就是源寄存器」的
+                  冗余 mov 消除，27ms → 21.5ms（约 26%）。本轮收益最大的一项。
+  寄存器池扩展 + 活跃分析（上 IR 的第一步）
+                  寄存器池从 4 个（r12-r15）扩展到 7 个 callee-saved
+                  （rbx/rsi/rdi/r12-r15），顺序分配。序言/epilogue 改为按 usedRegs
+                  位掩码 push/pop，不再硬编码「总是保存 r12-r15」。
+                  收益：5~7 个局部变量的函数不再溢出栈（4 池时第 5 个就溢出）。
+                  验收：7 个 i64 局部变量求和正确（=28）；rbx/rsi/rdi 经确认
+                  未被任何运行时辅助（emitMemCopy 用 R10/R11、syscall 用
+                  rax/rcx/rdx/r8/r9/r10）占用，扩展安全。
+                  基础设施：livenessStmt / livenessExpr 按 genStmt 同序遍历 AST，
+                  为每个变量算「首次出现 .. 最后出现」语句级区间；linear-scan
+                  的候选筛选 / 排序 / 过期 / 分配骨架都已就位。
+                  线性扫描复用（生命周期不重叠的变量共享寄存器）**已实现但关闭**：
+                  自举不收敛（rt.tc 复杂函数被生成错、运行崩溃），根因疑似
+                  「语句级区间在嵌套控制流 / 循环回边上低估了 last」，导致寄存器
+                  被过早复用。顺序分配正确，复用待「块级 + 回边感知」的精确
+                  活跃区间后再启用 —— 这也是完整线性 IR 化要解决的核心问题。
+                  一个展开交互 bug：一度把展开的 acc2Reg 从「固定 r15」改成
+                  findFreeSavedReg 动态借，结果嵌套展开会借到同一寄存器冲突，
+                  且路径处理函数被误展开（报「无法打开源文件」）。已回退：展开保持
+                  「regCount<4 时 acc2Reg = 12+regCount = r15」的原始逻辑。
+  PE 导入表（import "x.dll"）
+                  语言层：`import "kernel32.dll";` 之后的 extern fn 都从该 DLL 导入。
+                  一个隐藏的坑：loader 原本会把 import 行**从合并缓冲删掉**（文本展开），
+                  于是 parser 永远看不到 DLL 导入声明，dllId 恒 0，退化成普通 extern。
+                  改成「.dll 的 import 行原样保留、只展开 .tc 的 import」，parser 才能
+                  据此建立「后续 extern 属于该 DLL」的上下文。
+                  代码层：DLL 导入生成 `call qword ptr [rip + IAT项]`（FF /2 间接调用），
+                  不是 call rel32；Reloc kind=5，sym 存符号名。
+                  PE 层：导入表追加在 .data 尾部（必须可写，加载器要填 IAT）：
+                  ILT / IAT / Hint-Name / DLL 名 / Import Directory，DataDirectory[1]
+                  指向 Import Directory。
+                  验收：ExitProcess(42) → 退出码 42；GetStdHandle + WriteFile → 输出 OK
+                  （返回值、多参数、指针都正确）。
+                  另修一个 bug：entryIdx 查找没跳过 extern，extern 在前时入口 RVA
+                  变成 0（越界读），症状是 0xC0000005 访问违规 —— 与「重定位漏掉
+                  节间隔」一样，都是「程序能装、但行为全错」的静默类错误。
+                  限制：-c 模式暂不支持 DLL 导入（正确做法是 __imp_ 符号 + 链接器
+                  造导入表），已明确报错，不会生成错 .obj。
+  tc-ld --dll（工具链补全）
+                  tc-ld 新增 --dll / -d：生成动态库（IMAGE_FILE_DLL 特性位、
+                  AddressOfEntryPoint=0），导出所有 EXTERNAL 函数符号（含
+                  buildObj 为 pub 函数加的未修饰别名，如 add / mul）。
+                  导出表结构与单文件 -dll 一致，追加在 .rdata 尾部；追加后
+                  .rdata 变长，dataRva 必须重算，否则 .data 落进 .rdata 内部
+                  （与单文件 -dll 同一处陷阱，这次照抄了教训）。
+                  端到端验收：tc -c → tc-ld --dll → dlOpen 映射 → peExport("add")
+                  → 真实调用 fnAdd(40,2) = 42。
+                  一个参数坑：最初只匹配 `-d`，`--dll`（双横线）报「未知选项」，
+                  补上 a[1]=='-' && a[2]=='d' 的判定。
+                  （-c 的 DLL 导入见下一条。）
+
+  -c 的 DLL 导入（__imp_ 符号，工具链闭环的最后一块）
+                  buildObj：kind=5（DLL 导入）生成 `__imp_<func>` 的 UNDEFINED
+                  符号（SectionNumber=0），重定位 REL32 指向它。
+                  tc-ld：新增 -l <dll> 收集所有 __imp_ 符号、生成导入表（ILT/IAT/
+                  Hint-Name/DLL名/Import Directory，追加在 .data 尾部）、把 __imp_
+                  解析到 IAT 项。简化版只支持单 DLL（所有 __imp_ 归一个 -l）。
+                  端到端验收：t_imptest（GetStdHandle+WriteFile+ExitProcess）
+                  -c → tc-ld -l kernel32.dll → 运行输出 "OK"。
+                  一个隐蔽的坑（花了大量时间定位）：hdrSize 未对齐 FileAlignment。
+                  2 节时 hdrSize=0x1d8（472），.data 的 PointerToRawData=0x3d8 不是
+                  0x200 倍数，Windows 加载器拒绝映射（exit=5 拒绝访问 / 0xC0000005
+                  访问违规）。单文件 buildExe 恰好 3 节凑成 0x200 对齐，所以没暴露。
+                  修法：hdrSize = alignUp(..., FILE_ALIGN)。另：期间一度误判为
+                  「空 .rdata 导致 VA 冲突」，其实不是——对比工具逐字节 diff 显示
+                  .data 内容完全一致，才把注意力拉回 hdrSize。
+  多 DLL 导入（.drectve 指令，替代 -l）
+                  -l 只能指定一个 DLL，多 DLL 场景（kernel32 + user32 等）无从表达。
+                  改为 .drectve 节：buildObj 把「被实际调用」的 import 编码成
+                  `-import:<dll>:<func>` 空格分隔指令，写进 .obj 的第 4 节
+                  （节数随有无 .drectve 在 3/4 之间动态变化）。
+                  tc-ld 解析所有 .obj 的 .drectve：DLL 名去重进 gDllStr/gDllOff，
+                  func 进 gDrFunc*，再按函数名把 __imp_ 符号反查回所属 DLL，按 DLL
+                  分组生成 Import Directory（每 DLL 一组 ILT/IAT/Hint-Name/DLL名）。
+                  删除了 -l 参数——DLL 名现在由 .drectve 携带。
+                  验收：t_imptest 用 kernel32（GetStdHandle+WriteFile）+ user32
+                  （IsCharAlphaA）两个 DLL，-c → tc-ld（无 -l）→ 输出 "OK" 且
+                  IsCharAlphaA 返回值正确，两个 DLL 都真正被调用。
+                  两个坑：① TC 的 if 表达式返回值不可靠（`let x = if c {4} else {3}`
+                  实测返回 0），节数必须显式赋值，否则 NumberOfSections=0 整个
+                  .obj 结构崩坏（coffdump 显示 sections 0、符号表乱码）；② .drectve
+                  若写「全部声明」而非「被调用的」，声明但未用的 extern 会多出
+                  空 IAT 项且符号表对不上，改为只写 kind=5 重定位收集到的。
+  if 表达式误用（latent bug，两处修复）
+                  现象：`let x: u32 = if c { a } else { b }` 编译通过、x 恒为 0。
+                  根因一：parsePrimary 对语句关键字走「未知：跳过」兜底，把 if
+                  吞掉、返回 newExpr(IntLit)（ival 默认 0），后续 token 再被错当
+                  成独立语句——既错值又错结构。曾让 buildObj 的 secCount=0，
+                  整个 .obj 结构崩坏（NumberOfSections=0、coffdump 显示 sections 0）。
+                  根因二（更深）：编译成败只检查 semaRun 的语义错误数，parse 阶段
+                  的 gErrCount 完全没查——所以「报错却继续编译成功」。parse 的
+                  错误恢复会把非法输入拼成合法 AST，sema 看不出问题。
+                  修复一：parsePrimary 对语句关键字（if/while/for/switch/return/
+                  break/continue/let/var/fallthrough/else/elif）明确报
+                  「语句关键字不能用作表达式」，不再静默返回 0。
+                  修复二：parse 之后立即检查 diagErrors()，非零即 return 3，
+                  任何语法/加载错误都阻断编译。
+                  回归：tests/t_ifexpr.tc（--fail）固化，22 项全过。
+  泛型实例 -c 崩溃（internGet 数字 id）
+                  现象：-c 编译任何含泛型实例（vecNew/mapNew 等）的程序，
+                  编译器 0xC0000005 访问违规。
+                  根因：泛型实例的 fd->name = sem->instCounter（0x10000000 起的
+                  数字 id，非 intern id）。buildObj 生成 COFF 符号表时
+                  internGet(intern, name) 直接返回 pool.data + 0x10000000（远越界）。
+                  普通函数 name 是 intern id（mangled 名）所以没事，泛型实例一碰就崩。
+                  修复：buildObj 对泛型实例（name >= 0x10000000）改用 baseName
+                  （intern id，模板源名）作符号名，标 STATIC（内部，不跨文件）；
+                  别名导出同样跳过泛型实例（多个实例 baseName 相同会撞名）。
+                  另修 buildExe -dll 导出表 288 行同类隐患：namesBytes 长度计算
+                  本应用 baseName（与 325/347 行一致），却用了 name —— 泛型实例
+                  同样会崩，且 name 是 mangled 名、长度与 baseName 不符会算错表长。
+                  回归：tests/t_generic_obj.tc（-c → tc-ld → 运行）固化。
+                  注：泛型实例经 STATIC 符号走 tc-ld「节符号」分支，addend=函数
+                  在 .text 内的偏移，resolveAddr 恰好正确 —— 无需改链接器。
+  自研 IR（TIR）—— 框架完成、struct 全链路已修、自举仍差最后一步（genModule 已回退）
+                  目标：把「AST 直达机器码 + 语句级活跃区间」换成「AST → IR →
+                  指令级活跃分析 + 线性扫描寄存器分配 → 发射」，让寄存器能安全
+                  复用（提速）。刻意不做 SSA/phi（要拉长自举链）。
+                  已完成：tcc/tir.tc（槽/操作数/指令/块）+ emitExprIR/emitStmtIR
+                  （lowering，含 if/while/break/continue/switch/fallthrough）+
+                  allocRegs（指令级活跃 + 线性扫描 + 7 个 callee-saved 寄存器池）+
+                  x64.tc 的 genFuncIR2/emitIRInst（IR → 机器码）。
+                  一路修的 11 个真 bug：
+                  ① 连续槽只 newSlot 分配第一个，后续 argBase+i 槽号被复用（槽冲突）；
+                  ② 函数指针字段调用（gNt.xxx(...)）双重 load（Member 已 load 值）；
+                  ③ CALL/SYSCALL 的连续实参槽没进活跃分析 → 多实参全传成同一值；
+                  ④ 循环回边活跃区间被「线性首次/最后」低估 → 循环变量被复用寄存器
+                    （n 和 i 抢 r12，死循环/错值）—— 加了回边迭代扩展。
+                  ⑤ 数组 Ident 返回槽（数组内容）而非地址 → &arr[0] 传垃圾寄存器，
+                    实测 copyCStr(&outBuf[0], ...) 参数为 rdi 垃圾值。
+                  ⑥ emitCallIR 不处理 struct 返回（sret）→ internNew() 目的缓冲没传；
+                    被调用方把结果写进 RCX 里的垃圾值。
+                  ⑦ struct 赋值只拷 8 字节 → 新增 IR_MEMCPY 整块拷贝。
+                  ⑧ struct 返回（return p）没拷到 sret 缓冲 → 新增 IR_MEMCPY_PTR。
+                  ⑨ struct 实参未按引用传参（传值而非地址）。
+                  ⑩ struct 参数成员访问（byRef）未 load 指针（拿 &参数槽当基址）。
+                  ⑪ 形参是指针、实参是 struct（如 internC(intern,...)）时未取址。
+                  另：allocRegs 溢出槽按 slotSize 占位（sret 目的缓冲是 struct 大小）。
+                  验证：_sret.tc（struct 返回+赋值，48 字节全拷）、intern 赋值、
+                  copyCStr/getArg 的数组地址全部正确。
+                  未收敛：c2（IR 编译完整 tc_main）的 main 本身仍崩在 loadSource
+                  之前。入口/rtInit/internNew/copyCStr/getArg 均已验证正确，剩余
+                  问题在 main 的大函数发射（参数解析/exeDir/normPath/incAdd 某处）。
+                  处置：genModule 回退到旧 genFunc（IR 代码保留在 tir.tc/x64.tc 里，
+                  只是不再默认走），工具链恢复自举 c2==c3、22 项回归全过。下一轮
+                  从「c2 的 main 大函数发射」继续。
+  extern + 多文件链接
+                  语言层几乎已经就绪：词法器早就收录了 extern 关键字，
+                  parseFn 也早就支持 `fn xxx();` 这种无函数体形式
+                  （docs 里「extern 未进词法器」的记录是过时的）。
+                  语义层：extern 函数**不做模块修饰** —— 名字就是链接名（与 C 一致）。
+                  定义方仍按 mangled 名发射，由 buildObj 额外导出一个未修饰别名，
+                  两边才对得上。
+                  代码层：extern 不进 nameToIdx / emitFuncs（不发射函数体）；
+                  调用点识别 body == null 后生成 kind=4 重定位（Reloc 新增 sym 字段
+                  存符号 id，因为 target 是 u32 放不下 interned id）。
+                  COFF 层：kind=4 生成 SectionNumber = 0 的 UNDEFINED 符号。
+                  链接层：tc-ld 的「未解析符号」检查这时才真正有对象可查。
+                  闭环验收：ma.tc（导出 加/乘）+ mb.tc（extern 声明并调用），
+                  各自 `tc -c` 成 .obj，再由 tc-ld 合并，运行输出
+                  「加 = 42 / 乘 = 42」。
+                  单文件 PE 模式下用 extern 会明确报错
+                  （TC3「存在未解析的外部符号」），不会静默生成错跳转的 call。
+                  一个卡了两轮的坑：checkCall 从未回填 e->lhs->fref ——
+                  只有「取函数地址」的路径才填它。于是 genCall 判断不出 callee
+                  是 extern，nameToIdx 里又查不到（extern 不进表），静默退化成
+                  `mov rax, 0`：程序不崩、退出码 0，只是所有外部调用都返回 0。
+                  修法是双保险：checkCall 补 fref 回填，genCall 再按名字到声明表
+                  兜一次 —— 不依赖「哪个阶段填了 fref」这种隐式约定。
+  -c（COFF 目标文件）
+                  新增 buildObj：与 buildExe 共用「函数布局 / 字符串池 / 全局量」三段
+                  逻辑，区别只在重定位——PE 直接写绝对 disp32，COFF 写「节内偏移
+                  addend」并另建重定位表交给链接器算 S + A - P。
+                  重定位类型全是 IMAGE_REL_AMD64_REL32（0x0004），因为 TC 产物全程
+                  RIP 相对；若将来引入绝对地址引用需补 ADDR64。
+                  符号表固定布局：0=.text / 1=.rdata / 2=.data 节符号，其后是全部
+                  函数（EXTERNAL，value = .text 内偏移）与全局量。字符串引用指向
+                  .rdata 节符号 + addend（无具名符号），函数调用指向具名符号。
+                  -c 模式不需要 main：目标文件可以没有入口。
+                  布局正确性验收：同一份 bench_loop，PE 的 .text VirtualSize 25488
+                  = COFF 的 25488，.rdata 258 = 258，.data 2184 = 2184，完全一致。
+                  确定性：TimeDateStamp 恒 0，两次生成的 .obj 哈希相同
+                  （92ad93a6…，32,039 字节）。
+                  配套新增第 7 个工具 tc-coffdump：读 COFF 打印节 / 符号 / 重定位。
+                  （第 8 个 tc-ld 见下。）
+  tc-ld（链接器，第 8 个工具）
+                  把 COFF 目标文件链成 PE32+：逐文件拼接 .text/.rdata/.data，
+                  解析 EXTERNAL 符号（同名重复定义报错），应用 REL32 重定位，
+                  再生成 PE 头。入口默认找 main 或 *.main，可用 -e 覆盖。
+                  闭环验收：178 函数的 neonbreak 走完
+                  `tc -c` → `tc-ld` → 运行自检，6 项全过。
+                  一个极具误导性的 bug：重定位最初用「节内偏移」算 disp32，
+                  跨节引用（.text → .rdata）漏掉了节间隔
+                  alignUp(textV, 0x1000) - textV（本例 3184 字节）。
+                  表象是 PE 头全部正确（e_lfanew、入口点、各节大小都与直接
+                  编译一致），exe 能装载、退出码也是 0，只是**不输出任何东西**
+                  —— 因为 call rtPrint 跳到了错误地址。
+                  修法：重定位前先定各节 RVA，disp = targetRva - pRva - 4。
+                  另一个坑：COFF 节头的 VirtualSize / VirtualAddress 恒为 0，
+                  PE 节头必须填真实值，照搬会让加载器映射出空节。
+                  （extern 已落地，多文件链接见下一条。）
+  中文路径（UTF-16 → UTF-8）
+                  三处命令行/路径解析早期都是「非 ASCII 一律截断或替换」：
+                    · 编译器 getArg：`out[j] = cbuf[i] as u8` ——「示例」变成 ":\x8B"
+                    · 编译器 exeDir / exePath：`if ch >= 128 { break }` —— 只剩前缀
+                    · tclib parseCmdline：`b = 63` —— 整串变 '?'
+                  后果：含中文的源文件路径直接打不开（error[TC2] 无法打开源文件）；
+                  工具链装在中文目录下找不到 include/lib；exePath 还参与自举缓存键，
+                  截断后不同路径可能撞出同一键、缓存互相命中。
+                  现统一改为 UTF-16 → UTF-8（BMP 内 1~3 字节，代理对仍记 '?'，
+                  单参数上限 508 字节）。
+                  验收：`tc.exe build\_setup_out\示例\player.tc` 能正确解析中文路径；
+                        `tc-hash build\_setup_out\示例\player.tc` 输出
+                        "bf689a1f…  build\_setup_out\示例\player.tc"。
+  真实程序扫描结论
+                  用 6 个真实程序做端到端验证（不只是 bench_loop 微基准）：
+                    · games/neonbreak        ✅ 178 函数，自检 6 项全过
+                    · build/_cube.tc         ✅ 150 函数（win32 + m3d）
+                    · build/_r3d.tc          ✅ 157 函数
+                    · build/_clip.tc         ✅ 110 函数
+                    · build/_editor_demo.tc  ⚠️ 文件本身残缺（1192 行在
+                                             `g命令命中 = g命令命中 ` 处截断），
+                                             「期望 '}'」诊断正确，非编译器问题
+                    · build/_menuprobe / _pastetest / _basehost
+                                             ⚠️ 依赖已移除的 winLoadModule /
+                                             winExport / 编辑_* API，属历史探测脚本
+                  另：build/_setup_out 是过时的安装包快照（tclib 仍含
+                  winRegisterClass 重复定义、tcrt 缺 gInited），不要拿它验证。
+  死代码消除      genStmt 四处：
+                  1) Block：return / break / continue 之后的同块语句不再生成；
+                  2) ExprStmt：无副作用的表达式语句（如 `a + b;`）直接丢弃；
+                  3) If：tryEvalConst 能求成常量时只生成命中的分支；
+                  4) While：条件恒为 0 时整个循环不生成。
+                  tryEvalConst 处理字面量 + 短路逻辑，专门覆盖 `if false && ...`
+                  这类特性开关——本编译器里关闭定向发射的那段就是这么消掉的。
+                  诚实记录：本轮产物净增约 2KB，因为 DCE 实现本身（两个辅助函数
+                  + 四处判断）大于它消除的死代码；对开关密集的用户代码收益更明显。
+  循环展开 + 双累加器
+                  While 分支：识别 `while i < n { acc = <加法链>; i = i + 1 }`
+                  的朴素计数循环；若 regCount < 4（r15 空闲）则 2 倍展开，并把
+                  累加器分裂成 acc（原寄存器）与 acc2（r15）两条并行链，循环结束
+                  后 acc += acc2。bench_loop 22ms → 15ms（约 32%），累计 58ms →
+                  15ms（3.9 倍）。展开还顺带减半了循环开销（条件判断与跳转）。
+  循环条件特化    双累加器展开的条件判断：i / n 都在寄存器里时，用
+                  `lea rcx,[i+1]; cmp rcx,n; jl` 三条替代原来的六条
+                  （mov rax,i / add rax,1 / mov rcx,rax / mov rax,n / cmp / jl）。
+                  每轮指令从 8 条降到 6.5 条，bench 15ms → 13.5~14.5ms。
+  方法论：先观测再优化
+                  有了 tc-objdump 后第一次直接看到 bench_loop 的真实循环体：
+                  双累加器确实生效（r14 / r15 两条链完全并行），也第一次确认
+                  **瓶颈是每轮指令数（8 条）而非乘法延迟**——循环体 10 条 +
+                  检查 6 条（每 2 轮）。据此只把检查的 6 条压成 3 条，收益 7~10%。
+                  这与之前的两次误判形成对比：定向发射凭直觉做、结果慢 3ms；
+                  把 hexU64 的显示 bug 误判成编译器 bug、白查了半天栈帧。
+                  结论：没有观测的调优容易打错靶子。
+  编译速度基线    实测（当前机器）：
+                   tc_main.tc（428 函数）       90ms
+                   games/neonbreak（178 函数）   40ms
+                 结论：编译速度不是瓶颈，继续优化编译器的边际收益很低；
+                 真正值得投入的仍是「生成代码的运行时质量」（见上文 4.1 倍）。
+  修复 tclib 重复定义
+                  tclib/win/win32.tc 里 winRegisterClass 被定义了两次
+                  （544 行手工实现 + 887 行转调 winRegisterClassEx 的包装），
+                  导致所有 import win32.tc 的程序（如 games/neonbreak）都报
+                  「同一模块内函数重复定义」。已删掉 544 的旧实现、保留包装版。
+                  注意诊断的定位偏差：错误箭头指向 `var gPart` 那一行而非函数
+                  定义处，说明重复定义报的是「模块级符号位置」而不是真正的
+                  重定义行，排查时要按名字搜而不能只信行号。
+  一条误判的教训  findAccumulator 最初把循环变量 `i` 也判成累加器——`i = i + 1`
+                  完全符合加法链模式。展开后 i 被换到 r15，循环变量彻底错乱，
+                  c2 编译 c3 时所有 import 解析失败（146 个错误）。
+                  修法：accSym 必须 != s->cond->lhs->sym。
+  代数化简        genBinary：x+0/x-0/x|0/x^0/x<<0/x>>0 → x；x*1 → x；
+                  x*0/x&0 → 0（仅当 lhs 无副作用，否则不能丢弃求值）。
+  强度削减        x*2/4/8 → lea [x*scale]（简单 lea，Intel 上 1 周期，不占 ALU）；
+                  x*3/5/9 → lea [x + x*scale]（复杂 lea，3 周期，与 imul 持平）。
+  一条 lea 编码教训
+                  emitLeaPlusOne 的 base 是 dst 自己（不是「无 base」的 101 编码），
+                  mod=0 时不带位移。最初多发了 4 字节 disp32，导致 bench 程序崩溃
+                  （无输出）。emitLeaScale 用 base=5，才需要 disp32。
+  乘法不在关键路径
+                  实测 i*8（简单 lea，1 周期）与 i*3（复杂 lea，3 周期）同为 28ms，
+                  证明乘法延迟被隐藏——acc 的串行依赖链才是瓶颈。只有把赋值
+                  定向到目标寄存器、砍掉 acc 的往返搬移后才真正见效。
+  定向发射（genBinary 内，已关闭）
+                  genExprInto/canGenInto/tempReg/emitImmArithReg 在 genBinary 的通用
+                  二元路径里默认关闭（`if false && ...`）：实测 29~30ms，比 push/pop
+                  基线 27.5ms 还慢——store-forwarding 让 push/pop 几乎零成本。
+                  但同一套设施用于 genAssign 时收益巨大，故保留实现。
+  一个自举不收敛的根因
+                  genExprInto 的 Binary 分支递归前未做 canGenInto 预检查：
+                  rhs 不可定向时会回退到 genExpr（用 RAX），把外层已算好的
+                  lhs 冲掉，导致 c2 != c3（大小相同、内容不同）。补上
+                  `canGenInto(e->rhs, depth+1)` 后收敛。另外 sretSym 直接
+                  rtAlloc 未初始化 reg 字段，垃圾值让 assignRegs 判定不确定，
+                  也已补上 reg=-1 / addrTaken=false。
+  验收程序        tests\t_decl.tc（声明体）、build\_nt3/_nt4/_nt5.tc（新语法）
+                  其中 tests\t_decl.tc 已纳入 tools\test.cmd 常规回归
+
+  阶段 6（完成）  编译器自己的源码已全部迁到新语法：fn→def、花括号→缩进块、
+                  去掉行尾分号、struct/enum/union/switch 用缩进体。
+                  9 个文件 7995 行，由 tools\conv.tc 机械转换 + 自校验
+                  （花括号不平衡或行内布局无法判定时拒绝转换，不产出半对错的源码）。
+                  单行花括号块（if x { a; }）保留原样 —— 两种写法在同一文件里
+                  都合法，拆行风险大于收益。
+                  迁移过程暴露并修掉一个真缺陷：canEndStmt 不含 return/break/
+                  continue/fallthrough/true/false/null，这些词单独成行时不补
+                  虚拟分号，下一行会被当成它的表达式吞掉（整批文件报「期望 ')'」）。
+
+  模块隔离（新增）  import 不再是「裸文本展开 + 共享一个命名空间」。
+                   · 每个 module 维护自己的函数表 / 全局量表；
+                   · 顶层名字按「模块名.名字」修饰后进全局表（代码生成按修饰名寻址）；
+                   · 裸名解析：本模块优先 → 其它模块的 pub 导出（多于一个报歧义）；
+                   · 非 pub 的顶层符号在模块外不可见；
+                   · -dll 导出表按源名（baseName）命名，消费者照旧按源名查。
+                   验收：tests\t_iso.tc（两个模块同名私有符号各自绑定 =101/202）、
+                   t_iso_priv.tc（跨模块访问私有符号被拒）、t_dup.tc（同模块重名被拒）。
+
+import 解析顺序（相对路径优先，其次搜索根）
+  1) 相对「发出 import 的文件」所在目录（保持原有行为）
+  2) <root>\include
+  3) <root>\x86_64-w64-tcwin32\include
+  4) <root>\lib
+  5) <root>\x86_64-w64-tcwin32\lib
+  6) -I <目录>（可重复，最多累计 8 个根）
+  <root> = 编译器自身所在目录的上一级（由 PEB 的 ImagePathName 推出）
+  => 因此整个 TC64 目录可以搬到任意路径，只要 bin 在 PATH 里
+
+目录对照（mingw64 → TC64）
+  bin\gcc.exe              → bin\tc.exe                 编译器
+  include\                 → include\                  TC 头文件 / 运行时 / 核心库
+  lib\lib*.a               → lib\lib*.tc               库入口源文件（见下方说明）
+  libexec\                 → libexec\                  编译器源码与自举脚本
+  x86_64-w64-mingw32\      → x86_64-w64-tcwin32\       平台专属（当前留空，未绑定平台）
+  share\doc / examples     → share\doc / examples      文档与示例
+  licenses\                → licenses\                 许可与声明
+  etc\                     → etc\                      配置占位
+
+库形态说明（重要）
+  TC 是「整程序编译」：没有目标文件、没有链接器、产物零外部依赖。
+  所以 mingw 的 -ltcui 在 TC64 里对应  import "libtcui.tc";
+  即「单一入口源文件」而非 .a 归档。lib\ 下不会有真正的 .a 文件。
+
+当前平台立场
+  平台中立：只包含运行时、核心库、像素画布（不碰任何系统 API）。
+  Windows 绑定（win32 / winproc / winmenu / winedit / winshell / gpu3d / m3d）
+  仍留在源码仓库，未纳入本工具链。x86_64-w64-tcwin32 为空占位目录。
+
+已知问题（不掩饰）
+  1. 诊断已闭环：输出 文件:行:列 + 源码行 + 插入符 + error[TCxxxx] + 汇总，
+     格式与阶段 0（C++ 引导器）一致。实现方式：加载器逐行登记「来源文件 +
+     文件内行号」，diag.tc 按 line-1 直查，不做区间推算。
+     （2026-11-06 修复）列号精度：Expr 增加 line/col，解析时由 pAdvance
+     同步当前记号位置，sema 的 checkExpr 推进诊断位置；未声明函数等错误
+     现在精确指向 callee（实测 3:12 落在 undefinedFn），不再退回语句起始列。
+  2. 同名全局量重复定义检测已加入（error[TC2002] + 解释性 help），
+     编译期直接失败；局部变量原本已有同作用域重复检测。
+  3. 编译器已支持 -dll（IMAGE_FILE_DLL + 导出表）与自制动态加载器
+     （dlOpen/peExport，不需要 LoadLibrary）；导出表曾被 vecPush::<u32>
+     写进 Vec<u8> 导致 len 与字节数脱钩而截断，现已加编译期类型检查。
+  4. （更正）结构体数组字段**本来就是支持的**：实测 sizeof(Holder)=24、
+     n@0 / buf[4]@4 / tail@20 布局与下标访问全部正确。此前"不支持"的
+     结论来自"全仓没有这种写法"的错误推断，已撤回。
+  5. （已复验并更正）原记录「*泛型结构体<T> 形参成员访问失败」**不成立**：
+     原复现写的是 b.n，而 b 是 *PBox<T>，指针成员访问必须用 `->`（用 `.`
+     会被明确报「指针成员访问请用 ->（不是 .）」）。改成 `b->n` 后，
+     2026-11-06 用 tcc3 复验：编译成功（3 个函数）、运行退出码 42，
+     泛型实例化 + 指针成员访问 + 按引用传参全链路正常。
+     唯一前置条件：泛型调用目前需显式 turbofish（`getn::<i32>(&pb)`），
+     泛型实参推断尚未实现 —— 这是功能缺口，不是缺陷。
+  6. （2026-11-06 修复）诊断位置补全：此前 Expr / TypeRef 都不携带源码位置，
+     语义错误只能退到「语句起始列」；类型解析阶段更因 gPosLine 仍为 0 而
+     显示「编译单元第 0 行」。现在 Expr 与 TypeRef 都带 line/col：解析时由
+     pAdvance 同步当前记号位置，sema 的 checkExpr 与 resolveTypeRef 在报错前
+     推进/回设位置。实测：未声明函数定位到 3:12（callee 首字符）、未声明类型
+     定位到 _d_b.tc:1:15、import 在文件中间时被导入文件的行号映射也正确。
+  7. 模块隔离覆盖：函数、全局量、顶层 const、类型名（struct/enum/union），
+     并支持 **`模块.名字` 限定名** —— 类型、函数、全局量、const 四类均可显式
+     消歧（函数 / 全局量 / const 于 2026-11-07 补齐）。
+     实现要点（sema.tc）：
+       · checkExpr(Member) 开头判 base 是否为已加载模块名，是则依次查
+         consts / globals / funcs，并把 Member 节点就地改写成 Ident
+         （const 直接折叠成 IntLit），同时设置 gvar / fref；
+       · checkCall 开头补一条 Member 分支：先跑 checkExpr(e->lhs) 拿到 fref，
+         再把 e->lhs->id 改写为 qfd->name（修饰名）—— 漏这一步 genCall 会按
+         源名查重定位而落空，表现为「调用成功但返回 0」。
+     验收：qa.foo() = 101、qa.K = 7（跨模块 pub 函数与 const 限定名）。
+     实测：const 同名 pub → 歧义；非 pub 跨模块 → 未声明；单一 pub 可引用。
+     类型同名（两个模块各定义 P，大小 8 / 12）→ 裸名歧义；`isoTypeA.P` /
+     `isoTypeB.P` 精确选中（8*16+12=140）。
+     注：类型解析顺序为「本模块优先 → 其它模块 → 全局兜底」，尚未强制
+     类型声明的 pub 可见性（结构体暂不做 pub 检查）；函数/全局量/const 有。
+
+自举身份验证（任何人可原地复验，2026-11-06 已实测通过）
+  在仓库根目录执行：
+  1) "D:\zhuo miam\tanchise\tc64\bin\tc.exe" tcc\tc_main.tc -o build\_selfgen.exe
+     期望输出「编译成功：401 个函数。」
+     —— 这句话来自 TC 源码 tcc\diag.tc，C++ 引导器根本不会输出；
+     它能说这句话，就说明它内部跑的是 TC 写的那套前端。
+  2) certutil -hashfile build\_selfgen.exe SHA256
+     = 1eaa967082fda5376f22eb550c9b8134791a0c5614026afbe4a9434f5e837797
+  3) certutil -hashfile "D:\zhuo miam\tanchise\tc64\bin\tc.exe" SHA256
+     = 1eaa967082fda5376f22eb550c9b8134791a0c5614026afbe4a9434f5e837797
+     —— 两者逐字节相同：它用自己的源码精确复现了自己（不动点）。
+  一键复验：tools\selfhost2.cmd（要求 c1 == c2）
+
+ 关于链条起点（阶段 6 之后的变化，重要）
+   源码迁到新语法后，Stage-0（build\tc.exe，C++，只认旧语法）**无法再解析它**。
+   所以自举链改为「源码 + 一个已知可用的 TC 编译器二进制」：
+       build\tcc3.exe（上一代，认识新语法） → c1 → c2，要求 c1 == c2
+   这不是退步，而是自举编译器的常规形态（GCC / Clang / Rust 都这样）。
+
+ 最终退路（务必保留，不要删）
+   legacy\tcc_oldsyntax\ 保存着迁移前的旧语法源码（9 个文件）。
+   万一新语法链路彻底损坏，可按下面恢复：
+       copy legacy\tcc_oldsyntax\*.tc tcc\
+       tools\selfhost.cmd          （Stage-0 能编旧语法，链条照旧走得通）
+   代价是回到迁移前的状态：能重建一个可用的编译器，但没有新语法源码。
+
+维护约定
+  每次 tools\selfhost.cmd 之后运行 tools\sync_tc64.cmd，
+  把新的 build\tcc3.exe 同步进本工具链，并更新上面的 SHA256。
+======================================================================

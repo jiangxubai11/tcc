@@ -1,0 +1,127 @@
+// =============================================================================
+//  tclib/core/map.tc — u64 → V 开放寻址哈希表
+// -----------------------------------------------------------------------------
+//  面向编译器符号表等场景：键为 u64（字符串经驻留器 Interner 得到 id 后使用）。
+//  线性探查、无删除（符号表条目生命周期与编译过程一致），因此无墓碑。
+//  容量为 2 的幂，负载因子超过 0.5 时倍增扩容并重散列。
+// =============================================================================
+
+module tc.core.map;
+
+import "../../tcrt/core/mem.tc";
+
+pub struct MapU64<V> {
+    keys: *u64;
+    vals: *V;
+    used: *u8;      // 0 = 空，1 = 占用
+    cap: u64;       // 槽位数（2 的幂）
+    count: u64;     // 占用数
+}
+
+/// 乘法散列（黄金比例低 32 位），仅用移位与乘法，无大常量
+fn hashU64(k: u64) -> u64 {
+    var h: u64 = k * (2654435761 as u64);
+    h = h ^ (h >> 16);
+    h = h * (2246822519 as u64);
+    h = h ^ (h >> 13);
+    return h;
+}
+
+pub fn mapNew<V>() -> MapU64<V> {
+    var m: MapU64<V>;
+    m.keys = null;
+    m.vals = null;
+    m.used = null;
+    m.cap = 0;
+    m.count = 0;
+    return m;
+}
+
+pub fn mapCount<V>(m: *MapU64<V>) -> u64 {
+    return m->count;
+}
+
+fn mapGrow<V>(m: *MapU64<V>) -> bool {
+    var ncap: u64 = 16;
+    if m->cap > 0 {
+        ncap = m->cap * 2;
+    }
+    let nkeys: *u64 = rtAllocZero(ncap * 8, 16) as *u64;
+    let nvals: *V = rtAlloc(ncap * (sizeof(V) as u64), 16) as *V;
+    let nused: *u8 = rtAllocZero(ncap, 1) as *u8;
+    if (nkeys as u64) == 0 || (nvals as u64) == 0 || (nused as u64) == 0 {
+        return false;
+    }
+
+    // 重散列旧条目（旧表可能为空）
+    if m->cap > 0 {
+        var i: u64 = 0;
+        while i < m->cap {
+            if m->used[i] == 1 {
+                var idx: u64 = hashU64(m->keys[i]) % ncap;
+                while nused[idx] == 1 {
+                    idx = (idx + 1) % ncap;
+                }
+                nkeys[idx] = m->keys[i];
+                nvals[idx] = m->vals[i];
+                nused[idx] = 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    m->keys = nkeys;
+    m->vals = nvals;
+    m->used = nused;
+    m->cap = ncap;
+    return true;
+}
+
+/// 插入或覆盖。负载因子超过 0.5 时先扩容。
+pub fn mapPut<V>(m: *MapU64<V>, key: u64, val: V) -> void {
+    if m->cap == 0 || (m->count + 1) * 2 > m->cap {
+        if !mapGrow::<V>(m) {
+            return;
+        }
+    }
+    var idx: u64 = hashU64(key) % m->cap;
+    while m->used[idx] == 1 {
+        if m->keys[idx] == key {
+            m->vals[idx] = val;          // 覆盖已有键
+            return;
+        }
+        idx = (idx + 1) % m->cap;
+    }
+    m->keys[idx] = key;
+    m->vals[idx] = val;
+    m->used[idx] = 1;
+    m->count = m->count + 1;
+}
+
+/// 是否存在键
+pub fn mapHas<V>(m: *MapU64<V>, key: u64) -> bool {
+    if m->cap == 0 {
+        return false;
+    }
+    var idx: u64 = hashU64(key) % m->cap;
+    var guard: u64 = 0;
+    while m->used[idx] != 0 && guard <= m->cap {
+        if m->used[idx] == 1 && m->keys[idx] == key {
+            return true;
+        }
+        idx = (idx + 1) % m->cap;
+        guard = guard + 1;
+    }
+    return false;
+}
+
+/// 取值。调用方需先用 mapHas 确认键存在。
+pub fn mapGet<V>(m: *MapU64<V>, key: u64) -> V {
+    var idx: u64 = hashU64(key) % m->cap;
+    while true {
+        if m->used[idx] == 1 && m->keys[idx] == key {
+            return m->vals[idx];
+        }
+        idx = (idx + 1) % m->cap;
+    }
+}

@@ -1,0 +1,358 @@
+// =============================================================================
+//  examples/39_dx/cube.tc — D3D11 旋转彩色立方体
+// -----------------------------------------------------------------------------
+//  完整链路：D3D11 设备 → HLSL 着色器（运行时编译）→ 顶点缓冲 → 常量缓冲
+//            → 每帧算 MVP → 画家算法排序 6 个面 → Draw → Present
+//
+//  为什么用画家算法而不用深度缓冲：
+//    深度缓冲要多 5 个 COM vtable 下标（CreateTexture2D / CreateDepthStencilView /
+//    CreateDepthStencilState / OMSetRenderTargets 带 DSV / ClearDepthStencilView）
+//    和 3 个结构体。凸多面体按面心深度从远到近画，结果与深度测试等价，
+//    却只用已验证的 Draw(count, startVertex)。
+//
+//  编译：build\tcc3.exe examples\39_dx\cube.tc -o examples\39_dx\cube.exe
+//  运行：立方体持续旋转；ESC 或关窗口退出。诊断看同目录 dx.log。
+// =============================================================================
+
+module dx_cube
+
+import "tcrt/rt.tc"
+import "tclib/win/win32.tc"
+import "tclib/gfx/dx11.tc"
+
+var gRun: bool = true
+var gDx: Dx11
+var gGeom: Geom
+
+// 36 顶点 × 6 float（位置3 + 颜色3）
+var gVerts: [216]f32
+
+fn 过程(h: u64, msg: u32, wp: u64, lp: i64) -> i64 {
+    if msg == 0x0010 {
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    if msg == 0x0002 {
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    return wcall4(gWin.defWindowProcW, h, msg as u64, wp, lp as u64) as i64
+}
+
+// ---------------------------------------------------------------- 几何
+
+fn 写顶点(i: i32, x: f64, y: f64, z: f64, r: f64, g: f64, b: f64) -> void {
+    let k: i32 = i * 6
+    gVerts[k]     = x as f32
+    gVerts[k + 1] = y as f32
+    gVerts[k + 2] = z as f32
+    gVerts[k + 3] = r as f32
+    gVerts[k + 4] = g as f32
+    gVerts[k + 5] = b as f32
+}
+
+/// 每面 6 个顶点（2 个三角形）。面顺序：
+/// 0 前(+z) 1 右(+x) 2 后(-z) 3 左(-x) 4 上(+y) 5 下(-y)
+var gFaceN: [18]f64
+
+fn 建立立方体() -> void {
+    var cx: [8]f64
+    var cy: [8]f64
+    var cz: [8]f64
+    cx[0] = 0.0 - 1.0; cy[0] = 0.0 - 1.0; cz[0] = 1.0
+    cx[1] = 1.0;       cy[1] = 0.0 - 1.0; cz[1] = 1.0
+    cx[2] = 1.0;       cy[2] = 1.0;       cz[2] = 1.0
+    cx[3] = 0.0 - 1.0; cy[3] = 1.0;       cz[3] = 1.0
+    cx[4] = 1.0;       cy[4] = 0.0 - 1.0; cz[4] = 0.0 - 1.0
+    cx[5] = 0.0 - 1.0; cy[5] = 0.0 - 1.0; cz[5] = 0.0 - 1.0
+    cx[6] = 0.0 - 1.0; cy[6] = 1.0;       cz[6] = 0.0 - 1.0
+    cx[7] = 1.0;       cy[7] = 1.0;       cz[7] = 0.0 - 1.0
+
+    var fi: [24]i32
+    fi[0] = 0;  fi[1] = 1;  fi[2] = 2;  fi[3] = 3
+    fi[4] = 1;  fi[5] = 4;  fi[6] = 7;  fi[7] = 2
+    fi[8] = 4;  fi[9] = 5;  fi[10] = 6; fi[11] = 7
+    fi[12] = 5; fi[13] = 0; fi[14] = 3; fi[15] = 6
+    fi[16] = 3; fi[17] = 2; fi[18] = 7; fi[19] = 6
+    fi[20] = 5; fi[21] = 4; fi[22] = 1; fi[23] = 0
+
+    var fc: [18]f64
+    fc[0] = 1.0;  fc[1] = 0.2;  fc[2] = 0.2
+    fc[3] = 0.2;  fc[4] = 1.0;  fc[5] = 0.2
+    fc[6] = 0.2;  fc[7] = 0.4;  fc[8] = 1.0
+    fc[9] = 1.0;  fc[10] = 1.0; fc[11] = 0.2
+    fc[12] = 1.0; fc[13] = 0.2; fc[14] = 1.0
+    fc[15] = 0.2; fc[16] = 1.0; fc[17] = 1.0
+
+    gFaceN[0] = 0.0;  gFaceN[1] = 0.0;  gFaceN[2] = 1.0
+    gFaceN[3] = 1.0;  gFaceN[4] = 0.0;  gFaceN[5] = 0.0
+    gFaceN[6] = 0.0;  gFaceN[7] = 0.0;  gFaceN[8] = 0.0 - 1.0
+    gFaceN[9] = 0.0 - 1.0; gFaceN[10] = 0.0; gFaceN[11] = 0.0
+    gFaceN[12] = 0.0; gFaceN[13] = 1.0; gFaceN[14] = 0.0
+    gFaceN[15] = 0.0; gFaceN[16] = 0.0 - 1.0; gFaceN[17] = 0.0
+
+    var face: i32 = 0
+    var out: i32 = 0
+    while face < 6 {
+        let c0: i32 = fi[face * 4]
+        let c1: i32 = fi[face * 4 + 1]
+        let c2: i32 = fi[face * 4 + 2]
+        let c3: i32 = fi[face * 4 + 3]
+        let r: f64 = fc[face * 3]
+        let g: f64 = fc[face * 3 + 1]
+        let b: f64 = fc[face * 3 + 2]
+        写顶点(out, cx[c0], cy[c0], cz[c0], r, g, b); out = out + 1
+        写顶点(out, cx[c1], cy[c1], cz[c1], r, g, b); out = out + 1
+        写顶点(out, cx[c2], cy[c2], cz[c2], r, g, b); out = out + 1
+        写顶点(out, cx[c0], cy[c0], cz[c0], r, g, b); out = out + 1
+        写顶点(out, cx[c2], cy[c2], cz[c2], r, g, b); out = out + 1
+        写顶点(out, cx[c3], cy[c3], cz[c3], r, g, b); out = out + 1
+        face = face + 1
+    }
+}
+
+// ---------------------------------------------------------------- 矩阵（列主序）
+
+fn 矩阵乘(o: *f64, a: *f64, b: *f64) -> void {
+    var r: i32 = 0
+    while r < 4 {
+        var c: i32 = 0
+        while c < 4 {
+            var s: f64 = 0.0
+            var k: i32 = 0
+            while k < 4 {
+                s = s + a[k * 4 + r] * b[c * 4 + k]
+                k = k + 1
+            }
+            o[c * 4 + r] = s
+            c = c + 1
+        }
+        r = r + 1
+    }
+}
+
+fn 透视(m: *f64, aspect: f64, near: f64, far: f64) -> void {
+    let f: f64 = 1.0 / 0.5773502691896258   // tan(30°)
+    var i: i32 = 0
+    while i < 16 {
+        m[i] = 0.0
+        i = i + 1
+    }
+    m[0] = f / aspect
+    m[5] = f
+    m[10] = (far + near) / (near - far)
+    m[11] = 0.0 - 1.0
+    m[14] = (2.0 * far * near) / (near - far)
+}
+
+fn 视图(m: *f64, z: f64) -> void {
+    var i: i32 = 0
+    while i < 16 {
+        m[i] = 0.0
+        i = i + 1
+    }
+    m[0] = 1.0
+    m[5] = 1.0
+    m[10] = 1.0
+    m[14] = z
+    m[15] = 1.0
+}
+
+/// 模型矩阵 = Rx(ax) * Ry(ay)
+fn 模型(m: *f64, ax: f64, ay: f64) -> void {
+    let cx: f64 = cos(ax)
+    let sx: f64 = sin(ax)
+    let cy: f64 = cos(ay)
+    let sy: f64 = sin(ay)
+    let r00: f64 = cy
+    let r01: f64 = 0.0
+    let r02: f64 = sy
+    let r10: f64 = sx * sy
+    let r11: f64 = cx
+    let r12: f64 = 0.0 - sx * cy
+    let r20: f64 = 0.0 - cx * sy
+    let r21: f64 = sx
+    let r22: f64 = cx * cy
+    var i: i32 = 0
+    while i < 16 {
+        m[i] = 0.0
+        i = i + 1
+    }
+    m[0] = r00;  m[1] = r10;  m[2] = r20
+    m[4] = r01;  m[5] = r11;  m[6] = r21
+    m[8] = r02;  m[9] = r12;  m[10] = r22
+    m[15] = 1.0
+}
+
+// ---------------------------------------------------------------- 主流程
+
+fn main() -> i32 {
+    if !rtInit() {
+        return 1
+    }
+    rtPrint("[step] A1 rtInit ok\n")
+    if !winInit() {
+        rtPrint("[FAIL] winInit\n")
+        return 2
+    }
+    rtPrint("[step] A2 winInit ok\n")
+    dxLogOpen()
+    dxLog("进入 main")
+
+    if !winRegisterClassEx("DXCube", 过程, 0, 0x00000000) {
+        dxLog("失败: 注册窗口类")
+        return 4
+    }
+    let w: i32 = 720
+    let h: i32 = 560
+    rtPrint("[step] A3 class ok\n")
+    let hwnd: u64 = winCreateWindowFramed("DXCube", "D3D11 旋转立方体", w, h)
+    if hwnd == 0 {
+        dxLog("失败: 创建窗口")
+        return 5
+    }
+    rtPrint("[step] A4 window ok\n")
+    dxLog("窗口已创建（暂不显示）")
+
+    if !dxCreate(&gDx, hwnd, w, h) {
+        rtPrint("[FAIL] D3D11 初始化失败\n")
+        return 6
+    }
+    建立立方体()
+    if !dxMakeGeom(&gDx, &gGeom, &gVerts[0], 36) {
+        rtPrint("[FAIL] 几何/着色器创建失败\n")
+        return 7
+    }
+    rtPrint("[OK] D3D11 立方体已就绪\n")
+
+    // 初始化全部成功后才显示窗口：这样初始化期间不会出现「假死窗口」，
+    // 失败时屏幕上只剩置顶的错误对话框。
+    winShow(hwnd, SW_SHOW)
+    dxDiagTitle(hwnd, &gGeom)
+    dxLog("窗口已显示，进入消息循环")
+
+    var proj: [16]f64
+    var view: [16]f64
+    var model: [16]f64
+    var tmp: [16]f64
+    var mvp: [16]f64
+    透视(&proj[0], 720.0 / 560.0, 0.1, 100.0)
+    视图(&view[0], 0.0 - 3.5)
+
+    var zs: [6]f64
+    // 清屏色恢复为深蓝（亮红只是上一轮用来验证清屏是否生效的）
+    var bg: [4]f32
+    bg[0] = 0.05 as f32
+    bg[1] = 0.06 as f32
+    bg[2] = 0.10 as f32
+    bg[3] = 1.0 as f32
+
+    var ay: f64 = 0.0
+    var ax: f64 = 0.35
+    var frame: i32 = 0
+    rtPrint("[step] D1 loop enter\n")
+
+    while winPump() && gRun {
+        if keyDown(27) {
+            break
+        }
+        模型(&model[0], ax, ay)
+        矩阵乘(&tmp[0], &proj[0], &view[0])
+        矩阵乘(&mvp[0], &tmp[0], &model[0])
+
+        // 背面剔除：只画朝向相机的面。
+        // 凸立方体的正面之间互不遮挡，所以既不需要深度缓冲，也不需要排序 ——
+        // 排序一旦算错（比如把背面排到正面之后），就会出现「能同时看到 4 个面」
+        // 的翻面效果，正是上一版的问题。
+        var f: i32 = 0
+        while f < 6 {
+            let nx: f64 = gFaceN[f * 3]
+            let ny: f64 = gFaceN[f * 3 + 1]
+            let nz: f64 = gFaceN[f * 3 + 2]
+            // 列主序：M(r,c) = m[c*4+r]，取法线旋转后的 z 分量
+            zs[f] = model[2] * nx + model[6] * ny + model[10] * nz
+            f = f + 1
+        }
+
+        // ---- 颜色编码诊断（不用看控制台）----
+        // 红=vb 空  绿=cb 空  蓝=layout 空  品红=上传源指针空  黄=三项全正常
+        if gGeom.vb == 0 {
+            bg[0] = 1.0 as f32
+            bg[1] = 0.0 as f32
+            bg[2] = 0.0 as f32
+        } elif gGeom.cb == 0 {
+            bg[0] = 0.0 as f32
+            bg[1] = 1.0 as f32
+            bg[2] = 0.0 as f32
+        } elif gGeom.layout == 0 {
+            bg[0] = 0.0 as f32
+            bg[1] = 0.0 as f32
+            bg[2] = 1.0 as f32
+        } elif gGeom.pSys == 0 {
+            bg[0] = 1.0 as f32
+            bg[1] = 0.0 as f32
+            bg[2] = 1.0 as f32
+        } else {
+            bg[0] = 1.0 as f32
+            bg[1] = 1.0 as f32
+            bg[2] = 0.0 as f32
+        }
+        bg[3] = 1.0 as f32
+
+        dxClearColor(&gDx, &bg[0])
+        dxBindGeom(&gDx, &gGeom)
+        dxUpdateMatrix(&gDx, &gGeom, &mvp[0])
+        var d: i32 = 0
+        var drawn: i32 = 0
+        while d < 6 {
+            // 隔离测试：只画第 0 个面（前脸），预期是正中间一个红色正方形
+            if d == 0 {
+                dxDrawRange(&gDx, d * 6, 6)
+                drawn = drawn + 1
+            }
+            d = d + 1
+        }
+        if frame == 0 {
+            rtPrint("[dbg] drawn=")
+            rtPrintI64(drawn as i64)
+            rtPrint(" z=")
+            rtPrintI64((zs[0] * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((zs[1] * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((zs[2] * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((zs[3] * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((zs[4] * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((zs[5] * 1000.0) as i64)
+            rtPrintNl()
+            rtPrint("[dbg] v0=")
+            rtPrintI64((gVerts[0] as f64 * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((gVerts[1] as f64 * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((gVerts[2] as f64 * 1000.0) as i64)
+            rtPrint(" c0=")
+            rtPrintI64((gVerts[3] as f64 * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((gVerts[4] as f64 * 1000.0) as i64); rtPrint(",")
+            rtPrintI64((gVerts[5] as f64 * 1000.0) as i64)
+            rtPrintNl()
+        }
+        dxPresent(&gDx)
+
+        if frame == 0 {
+            rtPrint("[step] D2 first drawn\n")
+            dxLog("首帧已绘制")
+        }
+        if frame == 1 {
+            rtPrint("[step] D3 second frame\n")
+        }
+        frame = frame + 1
+        ay = ay + 0.02
+        winSleep(16)
+    }
+
+    dxLog("退出消息循环")
+    dxDestroyGeom(&gGeom)
+    dxDestroy(&gDx)
+    dxLog("资源已释放")
+    dxLogClose()
+    return 0
+}

@@ -1,0 +1,110 @@
+# =============================================================================
+#  tclib/core/mathx.tc — 常用标量数学
+# -----------------------------------------------------------------------------
+#  本文件用**新语法**书写（def / 缩进块 / 无分号 / # 注释），
+#  作为「新语法能否表达真实库代码」的验证样本。
+#  行为必须与旧语法版本完全一致：_mx.tc 的 15 条自检一个数字都不能变。
+#
+#  这些函数不需要编译器内建：它们只是普通 TC 代码。
+#  命名带类型后缀（absI / absF）是因为语言没有函数重载。
+# =============================================================================
+
+module tclib.core.mathx
+
+import "../../tcrt/rt.tc"
+
+# ---- 绝对值 ----
+
+def absI(v: i64) -> i64:
+    if v < 0:
+        return 0 - v
+    return v
+
+def absF(v: f64) -> f64:
+    if v < 0.0:
+        return 0.0 - v
+    return v
+
+# ---- 取小 / 取大 ----
+
+def minI(a: i64, b: i64) -> i64:
+    if a < b:
+        return a
+    return b
+
+def maxI(a: i64, b: i64) -> i64:
+    if a > b:
+        return a
+    return b
+
+def minF(a: f64, b: f64) -> f64:
+    if a < b:
+        return a
+    return b
+
+def maxF(a: f64, b: f64) -> f64:
+    if a > b:
+        return a
+    return b
+
+# ---- 钳制 / 插值 ----
+
+def clampI(v: i64, lo: i64, hi: i64) -> i64:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+def clampF(v: f64, lo: f64, hi: f64) -> f64:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+# 线性插值：t = 0 返回 a，t = 1 返回 b
+def lerp(a: f64, b: f64, t: f64) -> f64:
+    return a + (b - a) * t
+
+# 把 v 从 [a1, a2] 映射到 [b1, b2]（视口与参数映射常用）
+def remap(v: f64, a1: f64, a2: f64, b1: f64, b2: f64) -> f64:
+    if a2 == a1:
+        return b1
+    return b1 + (v - a1) * (b2 - b1) / (a2 - a1)
+
+# ---- 取整 ----
+
+# 向下取整（语言暂无 floor 内建）
+def floorF(v: f64) -> f64:
+    let t: i64 = v as i64
+    if (v as f64) < (t as f64):
+        return (t as f64) - 1.0
+    return t as f64
+
+# 向上取整
+def ceilF(v: f64) -> f64:
+    let t: i64 = v as i64
+    if (v as f64) > (t as f64):
+        return (t as f64) + 1.0
+    return t as f64
+
+# 四舍五入到最近整数
+def roundF(v: f64) -> f64:
+    if v < 0.0:
+        return 0.0 - floorF((0.0 - v) + 0.5)
+    return floorF(v + 0.5)
+
+# 整数快速幂：powI(2, 10) = 1024
+def powI(base: i64, exp: i64) -> i64:
+    var r: i64 = 1
+    var b: i64 = base
+    var e: i64 = exp
+    if e < 0:
+        return 0
+    while e > 0:
+        if (e & 1) != 0:
+            r = r * b
+        b = b * b
+        e = e >> 1
+    return r

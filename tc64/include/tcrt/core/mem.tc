@@ -1,0 +1,180 @@
+// =============================================================================
+//  tcrt/core/mem.tc — 内存管理
+// -----------------------------------------------------------------------------
+//  采用「区块 + 递增」分配器（bump allocator）：
+//
+//      · 以 1 MiB 为粒度向内核申请区块（NtAllocateVirtualMemory）
+//      · 分配只是在当前区块内抬高水位，O(1)，无任何簿记开销
+//      · 不做释放 —— 这是刻意的设计，对应项目既定的 region 内存模型：
+//        编译器「分配—使用—整批丢弃」，视频播放器「每帧重置」
+//
+//  释放语义由 rtResetAll 提供（整批归还）。需要细粒度释放的场景
+//  （长生命周期容器反复增删）留待 M4 的完整堆分配器。
+// =============================================================================
+
+module rt.core.mem;
+
+import "../sys/nt.tc";
+
+pub const BLOCK_SIZE: u64 = 1 << 20;      // 1 MiB
+
+/// 区块头。与区块数据在同一段虚拟内存内，避免分配头部自身造成递归。
+struct Block {
+    base: *u8;        // 数据区起点
+    size: u64;        // 数据区容量
+    used: u64;        // 已用字节
+    next: *Block;     // 链表（用于整批释放）
+}
+
+var gHead:    *Block = null;   // 最新区块（分配起点）
+var gAll:     *Block = null;   // 全部区块链表头
+var gTotal:   u64 = 0;
+var gUsed:    u64 = 0;
+
+// ---------------------------------------------------------------------------
+//  区块管理
+// ---------------------------------------------------------------------------
+
+fn newBlock(cap: u64) -> *Block {
+    // 区块头与数据一次申请，减少一半系统调用次数
+    let total: u64 = cap + sizeof(Block) + 64;
+
+    var base: u64 = 0;
+    var size: u64 = total;
+    let st: i64 = syscall(gNt.allocateVirtualMemory as u64,
+                          CURRENT_PROCESS,
+                          &base as u64,
+                          0,
+                          &size as u64,
+                          (MEM_COMMIT | MEM_RESERVE) as u64,
+                          PAGE_READWRITE as u64);
+    if st < 0 {
+        return null;
+    }
+
+    let b: *Block = base as *Block;
+    b->base = (base + sizeof(Block)) as *u8;
+    b->size = total - sizeof(Block);
+    b->used = 0;
+    b->next = null;
+
+    // 挂到总链表头；当前区块指针直接指向它
+    b->next = gAll;
+    gAll = b;
+    gHead = b;
+
+    gTotal = gTotal + b->size;
+    return b;
+}
+
+// ---------------------------------------------------------------------------
+//  分配
+// ---------------------------------------------------------------------------
+
+/// 分配 size 字节，按 align 对齐（align 必须是 2 的幂，0 视作 1）。
+/// 失败返回 null。
+pub fn rtAlloc(size: u64, align: u64) -> *u8 {
+    if size == 0 {
+        size = 1;
+    }
+    if align == 0 {
+        align = 1;
+    }
+
+    var b: *Block = gHead;
+    let need: u64 = size + align;
+
+    if (b as u64) == 0 || b->used + need > b->size {
+        var cap: u64 = BLOCK_SIZE;
+        if need > cap {
+            cap = need;
+        }
+        b = newBlock(cap);
+        if (b as u64) == 0 {
+            return null;
+        }
+    }
+
+    var p: u64 = (b->base as u64) + b->used;
+    let rem: u64 = p % align;
+    if rem != 0 {
+        p = p + (align - rem);
+    }
+    b->used = (p - (b->base as u64)) + size;
+    gUsed = gUsed + size + align;
+
+    return p as *u8;
+}
+
+/// 分配并清零
+pub fn rtAllocZero(size: u64, align: u64) -> *u8 {
+    let p: *u8 = rtAlloc(size, align);
+    rtMemZero(p, size);
+    return p;
+}
+
+/// 归还全部区块。之后所有既有指针立即失效。
+pub fn rtResetAll() -> void {
+    var b: *Block = gAll;
+    while (b as u64) != 0 {
+        let next: *Block = b->next;
+        var base: u64 = b as u64;
+        base = b as u64;
+        var sz: u64 = 0;                       // MEM_RELEASE 要求 RegionSize = 0
+        syscall(gNt.freeVirtualMemory as u64,
+                CURRENT_PROCESS,
+                &base as u64,
+                &sz as u64,
+                MEM_RELEASE as u64);
+        b = next;
+    }
+    gAll = null;
+    gHead = null;
+    gTotal = 0;
+    gUsed = 0;
+}
+
+pub fn rtBytesAllocated() -> u64 { return gUsed; }
+pub fn rtBytesReserved()  -> u64 { return gTotal; }
+
+// ---------------------------------------------------------------------------
+//  内存操作
+// ---------------------------------------------------------------------------
+
+pub fn rtMemCopy(dst: *u8, src: *u8, n: u64) -> void {
+    var i: u64 = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+pub fn rtMemZero(dst: *u8, n: u64) -> void {
+    var i: u64 = 0;
+    while i < n {
+        dst[i] = 0;
+        i = i + 1;
+    }
+}
+
+pub fn rtMemSet(dst: *u8, v: u8, n: u64) -> void {
+    var i: u64 = 0;
+    while i < n {
+        dst[i] = v;
+        i = i + 1;
+    }
+}
+
+/// 与 C 的 memcmp 语义一致：返回负 / 0 / 正
+pub fn rtMemCompare(a: *u8, b: *u8, n: u64) -> i64 {
+    var i: u64 = 0;
+    while i < n {
+        let x: u64 = a[i] as u64;
+        let y: u64 = b[i] as u64;
+        if x != y {
+            return (x as i64) - (y as i64);
+        }
+        i = i + 1;
+    }
+    return 0;
+}

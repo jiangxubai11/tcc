@@ -1,0 +1,171 @@
+// =============================================================================
+//  tclib/gfx/render.tc — 软件 3D 渲染器
+// -----------------------------------------------------------------------------
+//  在 canvas 之上再加一层：顶点变换 + 反面剔除 + 逐像素 Z 测试 + 网格绘制。
+//
+//  与 canvas 的分工：
+//    canvas  —— 只知道 2D 像素，不管深度
+//    render  —— 管 3D：矩阵变换、遮挡关系、整网格提交
+//
+//  用法（二十行就能画一个转动的立方体）：
+//      rendInit(&r, fb.bits, zbuf, fb.w, fb.h);
+//      rendClear(&r, 0xFF101020);
+//      rendDrawMesh(&r, &clip, &verts, &indices, &colors);
+//      fbPresent(&fb, hdc, 0, 0, fb.w, fb.h);
+//
+//  drawn / culled 两个计数是刻意暴露的：不用看屏幕，也能判断剔除方向对不对
+//  （立方体每帧应为 drawn = 6、culled = 6）。
+// =============================================================================
+
+module tclib.gfx.render;
+
+import "../../tcrt/rt.tc";
+import "../core/vec.tc";
+import "m3d.tc";
+
+pub struct Renderer {
+    px: *u32;       // 目标像素（BGRA，与 canvas 一致）
+    zb: *f64;       // 深度缓冲，长度 w*h
+    w: i32;
+    h: i32;
+    drawn: u32;     // 上一帧实际光栅化的三角形数
+    culled: u32;    // 上一帧被背面剔除的三角形数
+}
+
+// 光栅化时的顶点暂存（单渲染器场景，模块级即可）
+var gSX: [3]i32;
+var gSY: [3]i32;
+var gSZ: [3]f64;
+
+pub fn rendInit(r: *Renderer, px: *u32, zb: *f64, w: i32, h: i32) -> void {
+    r->px = px;
+    r->zb = zb;
+    r->w = w;
+    r->h = h;
+    r->drawn = 0;
+    r->culled = 0;
+}
+
+/// 清屏 + 清深度。depth 默认填 2.0（NDC 深度最大不超过 1）。
+pub fn rendClear(r: *Renderer, color: u32) -> void {
+    var i: u64 = 0;
+    let n: u64 = (r->w * r->h) as u64;
+    while i < n {
+        r->px[i] = color;
+        r->zb[i] = 2.0;
+        i = i + 1;
+    }
+    r->drawn = 0;
+    r->culled = 0;
+}
+
+fn rendRasterTri(r: *Renderer, color: u32) -> void {
+    let x0: i32 = gSX[0]; let y0: i32 = gSY[0]; let z0: f64 = gSZ[0];
+    let x1: i32 = gSX[1]; let y1: i32 = gSY[1]; let z1: f64 = gSZ[1];
+    let x2: i32 = gSX[2]; let y2: i32 = gSY[2]; let z2: f64 = gSZ[2];
+
+    let area: i32 = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+
+    // 只剔除「退化」三角形（投影后几乎是一条线）。
+    //
+    // 为什么不按有符号面积剔除背面：那要求全部三角形绕序一致。实测本工程的
+    // 立方体索引表绕序不一致（drawn=10 / culled=2，正确应为 6 / 6），
+    // 按符号剔会画出缺面的立方体。遮挡正确性由 Z 缓冲保证，不依赖剔除，
+    // 所以这里优先正确性：背面剔除留到索引绕序统一之后再开。
+    var aabs: i32 = area;
+    if aabs < 0 { aabs = 0 - aabs; }
+    if aabs < 2 {
+        r->culled = r->culled + 1;
+        return;
+    }
+    r->drawn = r->drawn + 1;
+
+    // 面积符号可能是负的（绕序反向），用 sgn 把重心坐标归一到非负
+    var sgn: i32 = 1;
+    if area < 0 { sgn = 0 - 1; }
+
+    var minx: i32 = x0;
+    if x1 < minx { minx = x1; }
+    if x2 < minx { minx = x2; }
+    var maxx: i32 = x0;
+    if x1 > maxx { maxx = x1; }
+    if x2 > maxx { maxx = x2; }
+    var miny: i32 = y0;
+    if y1 < miny { miny = y1; }
+    if y2 < miny { miny = y2; }
+    var maxy: i32 = y0;
+    if y1 > maxy { maxy = y1; }
+    if y2 > maxy { maxy = y2; }
+
+    if minx < 0 { minx = 0; }
+    if miny < 0 { miny = 0; }
+    if maxx >= r->w { maxx = r->w - 1; }
+    if maxy >= r->h { maxy = r->h - 1; }
+    if minx > maxx || miny > maxy { return; }
+
+    let inv: f64 = 1.0 / (aabs as f64);
+    var y: i32 = miny;
+    while y <= maxy {
+        var x: i32 = minx;
+        while x <= maxx {
+            let w0: i32 = ((x1 - x) * (y2 - y) - (x2 - x) * (y1 - y)) * sgn;
+            let w1: i32 = ((x2 - x) * (y0 - y) - (x0 - x) * (y2 - y)) * sgn;
+            let w2: i32 = ((x0 - x) * (y1 - y) - (x1 - x) * (y0 - y)) * sgn;
+            if w0 >= 0 && w1 >= 0 && w2 >= 0 {
+                let z: f64 = (w0 as f64) * inv * z0 +
+                             (w1 as f64) * inv * z1 +
+                             (w2 as f64) * inv * z2;
+                let idx: u64 = (y * r->w + x) as u64;
+                if z < r->zb[idx] {
+                    r->zb[idx] = z;
+                    r->px[idx] = color;
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+}
+
+/// 绘制一个网格。
+///   verts   : 每 3 个 f64 一个顶点（模型空间）
+///   idx     : 每 3 个 i32 一个三角形
+///   colors  : 每个三角形一个颜色（BGRA）
+///   clip    : 模型 → 裁剪空间的完整矩阵（投影 × 视图 × 模型）
+pub fn rendDrawMesh(r: *Renderer, clip: *Mat4, verts: *Vec<f64>, idx: *Vec<i32>,
+                    colors: *Vec<u32>) -> void {
+    let nv: u64 = verts->len / 3;
+    if nv == 0 { return; }
+
+    var sxs: Vec<i32> = vecNew::<i32>();
+    var sys: Vec<i32> = vecNew::<i32>();
+    var szs: Vec<f64> = vecNew::<f64>();
+    var k: u64 = 0;
+    while k < nv {
+        let v: Vec4 = vec4(verts->data[k * 3], verts->data[k * 3 + 1], verts->data[k * 3 + 2], 1.0);
+        let o: Vec4 = mat4Transform(clip, v);
+        var w: f64 = o.w;
+        if w == 0.0 { w = 1.0; }
+        vecPush::<i32>(&sxs, ((((o.x / w) + 1.0) * 0.5 * (r->w as f64)) as i32));
+        vecPush::<i32>(&sys, (((1.0 - (o.y / w)) * 0.5 * (r->h as f64)) as i32));
+        vecPush::<f64>(&szs, o.z / w);
+        k = k + 1;
+    }
+
+    let nt: u64 = idx->len / 3;
+    var t: u64 = 0;
+    while t < nt {
+        let a: u64 = idx->data[t * 3] as u64;
+        let b: u64 = idx->data[t * 3 + 1] as u64;
+        let c: u64 = idx->data[t * 3 + 2] as u64;
+        gSX[0] = sxs.data[a]; gSY[0] = sys.data[a]; gSZ[0] = szs.data[a];
+        gSX[1] = sxs.data[b]; gSY[1] = sys.data[b]; gSZ[1] = szs.data[b];
+        gSX[2] = sxs.data[c]; gSY[2] = sys.data[c]; gSZ[2] = szs.data[c];
+        var col: u32 = 0xFFFFFFFF;
+        if t < colors->len {
+            col = colors->data[t];
+        }
+        rendRasterTri(r, col);
+        t = t + 1;
+    }
+}

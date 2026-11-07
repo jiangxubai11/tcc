@@ -1,0 +1,30 @@
+# TC64 示例 1：控制台程序（平台中立，不碰任何系统 API）
+#
+# 编译（把 TC64\bin 加进 PATH 后）：
+#     tc hello.tc                -> a.exe
+#     tc hello.tc -o hello.exe
+#
+# 本文件用的是新语法：# 注释、def、无分号、缩进块。
+# 传统写法（fn / 花括号 / 分号）同样永久支持，两种可以混写。
+#
+# 注意：入口文件必须写 module 声明，并且要有 fn main() -> i32。
+module hello
+
+import "tcrt/rt.tc"
+
+def main() -> i32:
+    if !rtInit():
+        return 1
+
+    rtPrint("Hello, TC64!\n")
+
+    var i: i32 = 0
+    var sum: i32 = 0
+    while i < 10:
+        i = i + 1
+        sum = sum + i
+
+    rtPrint("1 + 2 + ... + 10 = ")
+    rtPrintI64(sum as i64)
+    rtPrint("\n")
+    return 0

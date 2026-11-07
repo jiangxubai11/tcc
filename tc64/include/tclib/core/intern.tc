@@ -1,0 +1,138 @@
+// =============================================================================
+//  tclib/core/intern.tc — 字符串驻留器 Interner
+// -----------------------------------------------------------------------------
+//  把字符串映射为唯一的 u64 id（id 即该字符串在字节池中的偏移），
+//  id 比较等价于字符串比较（O(1)）。用于编译器符号表：标识符 → 整数 id。
+//
+//  实现：字节池（Vec<u8>，每个字符串以 NUL 结尾）+ 开放寻址哈希表。
+//  哈希冲突通过「按完整字符串比较」消解，因此正确性不依赖哈希无碰撞。
+// =============================================================================
+
+module tc.core.intern;
+
+import "../../tcrt/core/mem.tc";
+import "vec.tc";
+
+pub struct Interner {
+    pool: Vec<u8>;      // 字节池：所有驻留字符串（每个以 NUL 结尾）
+    slots: *u64;        // 哈希槽：值为字节池偏移（0 = 空）
+    cap: u64;           // 槽位数（2 的幂）
+    count: u64;         // 占用槽位
+}
+
+/// djb2 字符串哈希（对短标识符足够）
+fn hashBytes(s: *u8, n: u64) -> u64 {
+    var h: u64 = 5381;
+    var i: u64 = 0;
+    while i < n {
+        h = ((h << 5) + h) + (s[i] as u64);
+        i = i + 1;
+    }
+    return h;
+}
+
+/// 字节池 [off, off+n) 是否与 s[0..n) 完全相同，且都以 NUL 结尾
+fn bytesEq(pool: *u8, off: u64, s: *u8, n: u64) -> bool {
+    var i: u64 = 0;
+    while i < n {
+        if pool[off + i] != s[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return pool[off + n] == 0;
+}
+
+pub fn internNew() -> Interner {
+    var it: Interner;
+    it.pool = vecNew::<u8>();
+    it.slots = null;
+    it.cap = 0;
+    it.count = 0;
+    return it;
+}
+
+fn internGrow(it: *Interner) -> bool {
+    var ncap: u64 = 16;
+    if it->cap > 0 {
+        ncap = it->cap * 2;
+    }
+    let nslots: *u64 = rtAllocZero(ncap * 8, 16) as *u64;
+    if (nslots as u64) == 0 {
+        return false;
+    }
+    // 重散列旧条目。槽内存储的是「偏移 + 1」，因为 0 被用作空槽哨兵，
+    // 而首个字符串的偏移恰好为 0，两者必须区分。
+    if it->cap > 0 {
+        var i: u64 = 0;
+        while i < it->cap {
+            let off1: u64 = it->slots[i];
+            if off1 != 0 {
+                let off: u64 = off1 - 1;
+                // 长度：扫描到 NUL
+                var n: u64 = 0;
+                while it->pool.data[off + n] != 0 {
+                    n = n + 1;
+                }
+                let h: u64 = hashBytes(it->pool.data + off, n);
+                var idx: u64 = h % ncap;
+                while nslots[idx] != 0 {
+                    idx = (idx + 1) % ncap;
+                }
+                nslots[idx] = off + 1;
+            }
+            i = i + 1;
+        }
+    }
+    it->slots = nslots;
+    it->cap = ncap;
+    return true;
+}
+
+/// 驻留长度已知的字符串，返回 id（字节池偏移）
+pub fn internN(it: *Interner, s: *u8, n: u64) -> u64 {
+    if it->cap == 0 || (it->count + 1) * 2 > it->cap {
+        if !internGrow(it) {
+            return 0;
+        }
+    }
+    let h: u64 = hashBytes(s, n);
+    var idx: u64 = h % it->cap;
+    while it->slots[idx] != 0 {
+        let off: u64 = it->slots[idx] - 1;
+        if bytesEq(it->pool.data, off, s, n) {
+            return off;
+        }
+        idx = (idx + 1) % it->cap;
+    }
+    // 新字符串：追加到字节池
+    let off: u64 = it->pool.len;
+    var i: u64 = 0;
+    while i < n {
+        vecPush::<u8>(&it->pool, s[i]);
+        i = i + 1;
+    }
+    vecPush::<u8>(&it->pool, 0);
+    it->slots[idx] = off + 1;
+    it->count = it->count + 1;
+    return off;
+}
+
+/// 驻留 NUL 结尾的 C 字符串
+pub fn internC(it: *Interner, s: *u8) -> u64 {
+    var n: u64 = 0;
+    while s[n] != 0 {
+        n = n + 1;
+    }
+    return internN(it, s, n);
+}
+
+/// 由 id 取回字符串（NUL 结尾，只读）
+pub fn internGet(it: *Interner, id: u64) -> *u8 {
+    return it->pool.data + id;
+}
+
+/// 已驻留的字符串数量
+pub fn internCount(it: *Interner) -> u64 {
+    return it->count;
+}

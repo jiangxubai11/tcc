@@ -1,0 +1,74 @@
+// TC64 示例 2：像素画布（纯内存，不绑定任何平台 API）
+//
+// 用法：
+//     tc canvas_demo.tc -o canvas_demo.exe
+//
+// 本示例同时验证两件事：
+//   1) import "libtcgfx.tc" 由 <root>\lib 搜索根解析（对应 mingw 的 -ltcgfx）
+//   2) 画布绘制（填充 / 圆 / 线）在纯内存里工作，可断言
+module canvas_demo;
+
+import "libtcgfx.tc";
+
+fn main() -> i32 {
+    if !rtInit() {
+        return 1;
+    }
+
+    var w: i32 = 64;
+    var h: i32 = 32;
+    let px: *u32 = rtAllocZero((w * h * 4) as u64, 4) as *u32;
+
+    var cv: Canvas;
+    canvasInit(&cv, px, w, h, w * 4);
+    canvasClear(&cv, 0xFF101018);
+    canvasFillCircle(&cv, 32, 16, 12, 0xFF22CC88);
+    canvasFillRect(&cv, 4, 4, 10, 6, 0xFFCC3355);
+    canvasLine(&cv, 0, 31, 63, 0, 0xFF88AAFF);
+
+    // 断言用：非背景像素数量
+    var lit: i32 = 0;
+    var i: i32 = 0;
+    while i < w * h {
+        if px[i] != 0xFF101018 {
+            lit = lit + 1;
+        }
+        i = i + 1;
+    }
+
+    rtPrint("canvas ");
+    rtPrintI64(w as i64);
+    rtPrint("x");
+    rtPrintI64(h as i64);
+    rtPrint(" 非背景像素 = ");
+    rtPrintI64(lit as i64);
+    rtPrint("\n");
+
+    // ASCII 预览（每 2x2 取一点）
+    var y: i32 = 0;
+    while y < h {
+        var x: i32 = 0;
+        while x < w {
+            let c: u32 = px[y * w + x];
+            if c == 0xFF101018 {
+                rtPrint(".");
+            } else if c == 0xFF22CC88 {
+                rtPrint("o");
+            } else if c == 0xFFCC3355 {
+                rtPrint("#");
+            } else {
+                rtPrint("+");
+            }
+            x = x + 2;
+        }
+        rtPrint("\n");
+        y = y + 2;
+    }
+
+    if lit > 100 {
+        rtPrint("[PASS] 像素画布绘制正常（含 lib 搜索根解析）\n");
+        return 0;
+    }
+    rtPrint("[FAIL] 画布未产生像素\n");
+    return 2;
+}

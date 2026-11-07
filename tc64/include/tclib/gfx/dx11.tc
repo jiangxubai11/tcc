@@ -1,0 +1,1140 @@
+// =============================================================================
+//  tclib/gfx/dx11.tc — Direct3D 11 最小绑定（真显卡）
+// -----------------------------------------------------------------------------
+//  为什么 D3D11 适合本项目：
+//    · 所有 API 的实参都是「整数 / 指针」，浮点全部走内存结构体
+//      ⇒ 绕开本编译器「浮点实参不走 XMM」的限制（见 gl.tc 顶部说明）
+//    · 只需运行时解析 d3d11.dll / dxgi.dll 的三个入口
+//
+//  唯一难点是 COM vtable 下标，写错一个就是 0xC0000005。所以：
+//    · 下标集中在本文件，注释标明来源（d3d11.h 的声明顺序，IUnknown 占 0..2）
+//    · 每一步都写 dx.log，崩了也能知道停在哪一步
+//
+//  本步覆盖：设备 + 交换链 + 渲染目标 + 清屏 + Present
+//  下一步：着色器编译（d3dcompiler_47）+ 顶点缓冲 + Draw
+// =============================================================================
+
+module tclib.gfx.dx11
+
+import "../../tcrt/rt.tc"
+import "../../tcrt/sys/nt.tc"
+import "../win/win32.tc"
+import "../win/dload.tc"
+
+// ---------------------------------------------------------------- 常量
+pub const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28
+pub const DXGI_USAGE_RENDER_TARGET_OUTPUT: u32 = 0x20
+pub const DXGI_SWAP_EFFECT_DISCARD: u32 = 0
+pub const D3D_DRIVER_TYPE_HARDWARE: u32 = 1
+pub const D3D11_SDK_VERSION: u32 = 7
+pub const D3D11_MAP_WRITE_DISCARD: u32 = 4
+
+// IUnknown 的三个方法在所有 COM 接口里都是 0/1/2
+pub const COM_QUERY_INTERFACE: u64 = 0
+pub const COM_ADD_REF: u64 = 1
+pub const COM_RELEASE: u64 = 2
+
+// IDXGISwapChain —— 注意继承链，IUnknown(0..2) + IDXGIObject(3..6) +
+// IDXGIDeviceSubObject(7) 之后才是 SwapChain 自己的方法：
+//     8  Present   9  GetBuffer   10 SetFullscreenState ...
+pub const SC_PRESENT: u64 = 8
+pub const SC_GET_BUFFER: u64 = 9
+
+// ID3D11Device
+pub const DEV_CREATE_BUFFER: u64 = 3
+pub const DEV_CREATE_RENDERTARGET_VIEW: u64 = 9
+pub const DEV_CREATE_INPUT_LAYOUT: u64 = 11
+pub const DEV_CREATE_VERTEX_SHADER: u64 = 12
+pub const DEV_CREATE_PIXEL_SHADER: u64 = 15
+
+// ID3D11DeviceContext
+pub const CTX_VS_SET_CONSTANT_BUFFERS: u64 = 7
+pub const CTX_PS_SET_SHADER: u64 = 9
+pub const CTX_VS_SET_SHADER: u64 = 11
+pub const CTX_DRAW: u64 = 13
+pub const CTX_MAP: u64 = 14
+pub const CTX_UNMAP: u64 = 15
+pub const CTX_IA_SET_INPUT_LAYOUT: u64 = 17
+pub const CTX_IA_SET_VERTEX_BUFFERS: u64 = 18
+pub const CTX_IA_SET_PRIMITIVE_TOPOLOGY: u64 = 24
+pub const CTX_OM_SET_RENDER_TARGETS: u64 = 33
+pub const CTX_RS_SET_VIEWPORTS: u64 = 44
+pub const CTX_CLEAR_RENDER_TARGET_VIEW: u64 = 49
+
+// ---------------------------------------------------------------- 诊断日志
+var gLogF: File
+var gLogOk: bool = false
+var gLogN: i32 = 0
+
+pub fn dxLogOpen() -> void {
+    gLogF = rtFileCreate("dx.log")
+    gLogOk = gLogF.ok
+    gLogN = 0
+}
+
+/// 纯 ASCII 步骤标记 → 打到控制台。
+/// 为什么单独搞一套：对话框可能弹不出来（崩溃时进程直接消失），
+/// dx.log 可能落在别的目录；而 ASCII 输出不受代码页影响，崩溃前已打印的
+/// 内容会留在控制台窗口里，是最后一道可靠的定位手段。
+pub fn 标记(s: *u8) -> void {
+    rtPrint("[step] ")
+    rtPrint(s)
+    rtPrint("\n")
+}
+
+/// 最近一次记录的 HRESULT（dxLogNum 更新），失败弹窗时一并显示
+var gLastHr: i64 = 0
+
+/// 主窗口句柄，用于给失败对话框当属主（否则对话框可能藏到主窗口后面）
+pub var gDxHwnd: u64 = 0
+
+/// 写一行「步号 文本\n」。崩溃时前面已写出的行会留在磁盘上。
+/// 若文本以「失」开头（失败信息），额外弹一个**置顶**对话框并附上 HRESULT ——
+/// 这样即使找不到 dx.log，也能直接在界面上看到是哪一步失败、返回码是多少。
+pub fn dxLog(s: *u8) -> void {
+    if s[0] == 0xE5 && s[1] == 0xA4 && s[2] == 0xB1 {
+        var m: [192]u8
+        var n: u64 = 0
+        var i: u64 = 0
+        while s[i] != 0 && n < 140 {
+            m[n] = s[i]
+            n = n + 1
+            i = i + 1
+        }
+        m[n] = 32; n = n + 1          // ' '
+        m[n] = 104; n = n + 1         // 'h'
+        m[n] = 114; n = n + 1         // 'r'
+        m[n] = 61; n = n + 1          // '='
+        var u: u64 = gLastHr as u64
+        var neg: bool = false
+        if gLastHr < 0 {
+            neg = true
+            u = (0 - gLastHr) as u64
+        }
+        if neg {
+            m[n] = 45
+            n = n + 1
+        }
+        var dg: [24]u8
+        var dgn: u64 = 0
+        if u == 0 {
+            dg[0] = 48
+            dgn = 1
+        } else {
+            while u > 0 {
+                dg[dgn] = (48 + (u % 10) as i32) as u8
+                dgn = dgn + 1
+                u = u / 10
+            }
+        }
+        while dgn > 0 {
+            dgn = dgn - 1
+            m[n] = dg[dgn]
+            n = n + 1
+        }
+        m[n] = 0
+        // MB_ICONERROR(0x10) | MB_SETFOREGROUND(0x10000) | MB_TOPMOST(0x40000)
+        winMsgBox(gDxHwnd, &m[0], "D3D11 失败", 0x50010)
+    }
+    if !gLogOk {
+        return
+    }
+    gLogN = gLogN + 1
+    var b: [160]u8
+    var n: u64 = 0
+    var v: i32 = gLogN
+    var dig: [8]u8
+    var dn: u64 = 0
+    if v == 0 {
+        dig[0] = 48
+        dn = 1
+    } else {
+        while v > 0 {
+            dig[dn] = (48 + (v % 10)) as u8
+            dn = dn + 1
+            v = v / 10
+        }
+    }
+    while dn > 0 {
+        dn = dn - 1
+        b[n] = dig[dn]
+        n = n + 1
+    }
+    b[n] = 58; n = n + 1       // ':'
+    b[n] = 32; n = n + 1       // ' '
+    var i: u64 = 0
+    while s[i] != 0 && n < 150 {
+        b[n] = s[i]
+        n = n + 1
+        i = i + 1
+    }
+    b[n] = 10
+    n = n + 1
+    rtFileWrite(&gLogF, &b[0], n)
+}
+
+/// 写「前缀 + 十进制数」到日志（诊断 HRESULT 用）
+pub fn dxLogNum(prefix: *u8, v: i64) -> void {
+    if !gLogOk {
+        return
+    }
+    gLogN = gLogN + 1
+    var b: [160]u8
+    var n: u64 = 0
+    var x: i32 = gLogN
+    var dig: [8]u8
+    var dn: u64 = 0
+    gLastHr = v
+    while x > 0 {
+        dig[dn] = (48 + (x % 10)) as u8
+        dn = dn + 1
+        x = x / 10
+    }
+    while dn > 0 {
+        dn = dn - 1
+        b[n] = dig[dn]
+        n = n + 1
+    }
+    b[n] = 58; n = n + 1
+    b[n] = 32; n = n + 1
+    var i: u64 = 0
+    while prefix[i] != 0 && n < 100 {
+        b[n] = prefix[i]
+        n = n + 1
+        i = i + 1
+    }
+    b[n] = 61; n = n + 1       // '='
+    var neg: bool = false
+    var u: u64 = v as u64
+    if v < 0 {
+        neg = true
+        u = (0 - v) as u64
+    }
+    if neg {
+        b[n] = 45
+        n = n + 1
+    }
+    var d2: [24]u8
+    var d2n: u64 = 0
+    if u == 0 {
+        d2[0] = 48
+        d2n = 1
+    } else {
+        while u > 0 {
+            d2[d2n] = (48 + (u % 10) as i32) as u8
+            d2n = d2n + 1
+            u = u / 10
+        }
+    }
+    while d2n > 0 {
+        d2n = d2n - 1
+        b[n] = d2[d2n]
+        n = n + 1
+    }
+    b[n] = 10
+    n = n + 1
+    rtFileWrite(&gLogF, &b[0], n)
+}
+
+pub fn dxLogClose() -> void {
+    if gLogOk {
+        rtFileClose(&gLogF)
+        gLogOk = false
+    }
+}
+
+// ---------------------------------------------------------------- 小工具
+
+fn 写u32(p: *u8, off: i32, v: u32) -> void {
+    p[off]     = (v & 0xFF) as u8
+    p[off + 1] = ((v >> 8) & 0xFF) as u8
+    p[off + 2] = ((v >> 16) & 0xFF) as u8
+    p[off + 3] = ((v >> 24) & 0xFF) as u8
+}
+
+fn 写ptr(p: *u8, off: i32, v: u64) -> void {
+    var i: i32 = 0
+    var x: u64 = v
+    while i < 8 {
+        p[off + i] = (x & 0xFF) as u8
+        x = x >> 8
+        i = i + 1
+    }
+}
+
+fn 清零(p: *u8, n: u32) -> void {
+    var i: u32 = 0
+    while i < n {
+        p[i] = 0
+        i = i + 1
+    }
+}
+
+/// 取 COM 对象第 idx 个方法的地址
+/// COM 对象布局：obj -> [vtable 指针] -> [方法0, 方法1, ...]
+/// 这里刻意不用 `**u64`（二级指针类型在本编译器下是否按预期解引用未经验证），
+/// 改用两次单层指针访问，语义等价且更可控。
+fn 方法(obj: u64, idx: u64) -> u64 {
+    if obj == 0 {
+        return 0
+    }
+    let pObj: *u64 = obj as *u64      // 指向对象首 8 字节
+    let vtAddr: u64 = *pObj           // 首 8 字节 = vtable 地址
+    if vtAddr == 0 {
+        return 0
+    }
+    let pVt: *u64 = vtAddr as *u64    // 指向方法表
+    return pVt[idx]
+}
+
+pub fn dxRelease(obj: *u64) -> void {
+    if *obj != 0 {
+        let m: u64 = 方法(*obj, COM_RELEASE)
+        if m != 0 {
+            wcall1(m, *obj)
+        }
+        *obj = 0
+    }
+}
+
+fn 加载DLL(name: *u8) -> u64 {
+    let k32: *u8 = findModule("kernel32.dll")
+    if (k32 as u64) == 0 {
+        return 0
+    }
+    let p: u64 = peExport(k32 as u64, "LoadLibraryA")
+    if p == 0 {
+        return 0
+    }
+    let fp: fn(u64) -> u64 = p as fn(u64) -> u64
+    return fp(name as u64)
+}
+
+// ---------------------------------------------------------------- 设备
+
+pub struct Dx11 {
+    swapChain: u64
+    device: u64
+    context: u64
+    rtv: u64
+    width: i32
+    height: i32
+    hwnd: u64
+}
+
+var gCreateDevice: u64 = 0
+var gDxLoaded: bool = false
+
+/// IID_ID3D11Texture2D = {6f15aaf2-d208-4e89-9ab4-489535d34f9c}
+var gIidTex2D: [16]u8
+
+fn 铺IID() -> void {
+    gIidTex2D[0] = 0xF2; gIidTex2D[1] = 0xAA; gIidTex2D[2] = 0x15; gIidTex2D[3] = 0x6F
+    gIidTex2D[4] = 0x08; gIidTex2D[5] = 0xD2
+    gIidTex2D[6] = 0x89; gIidTex2D[7] = 0x4E
+    gIidTex2D[8] = 0x9A; gIidTex2D[9] = 0xB4
+    gIidTex2D[10] = 0x48; gIidTex2D[11] = 0x95
+    gIidTex2D[12] = 0x35; gIidTex2D[13] = 0xD3
+    gIidTex2D[14] = 0x4F; gIidTex2D[15] = 0x9C
+}
+
+fn dxLoadAll() -> bool {
+    if gDxLoaded {
+        return true
+    }
+    let d3d: u64 = 加载DLL("d3d11.dll")
+    if d3d == 0 {
+        dxLog("失败: 加载 d3d11.dll")
+        return false
+    }
+    gCreateDevice = peExport(d3d, "D3D11CreateDeviceAndSwapChain")
+    if gCreateDevice == 0 {
+        dxLog("失败: 找不到 D3D11CreateDeviceAndSwapChain")
+        return false
+    }
+    铺IID()
+    gDxLoaded = true
+    dxLog("d3d11.dll 已解析")
+    return true
+}
+
+/// 建设备 + 交换链 + 渲染目标视图
+pub fn dxCreate(d: *Dx11, hwnd: u64, w: i32, h: i32) -> bool {
+    d->swapChain = 0
+    d->device = 0
+    d->context = 0
+    d->rtv = 0
+    d->width = w
+    d->height = h
+    d->hwnd = hwnd
+    gDxHwnd = hwnd
+    标记("B1 dxCreate start")
+
+    if !dxLoadAll() {
+        return false
+    }
+
+    // ---- DXGI_SWAP_CHAIN_DESC（72 字节）----
+    var desc: [72]u8
+    清零(&desc[0], 72)
+    写u32(&desc[0], 0, w as u32)                  // BufferDesc.Width
+    写u32(&desc[0], 4, h as u32)                  // BufferDesc.Height
+    写u32(&desc[0], 8, 60)                        // RefreshRate.Numerator
+    写u32(&desc[0], 12, 1)                        // RefreshRate.Denominator
+    写u32(&desc[0], 16, DXGI_FORMAT_R8G8B8A8_UNORM)
+    写u32(&desc[0], 20, 0)                        // ScanlineOrdering
+    写u32(&desc[0], 24, 0)                        // Scaling
+    写u32(&desc[0], 28, 1)                        // SampleDesc.Count
+    写u32(&desc[0], 32, 0)                        // SampleDesc.Quality
+    写u32(&desc[0], 36, DXGI_USAGE_RENDER_TARGET_OUTPUT)
+    写u32(&desc[0], 40, 2)                        // BufferCount
+    写ptr(&desc[0], 48, hwnd)                     // OutputWindow
+    写u32(&desc[0], 56, 1)                        // Windowed
+    写u32(&desc[0], 60, DXGI_SWAP_EFFECT_DISCARD)
+    写u32(&desc[0], 64, 0)                        // Flags
+    dxLog("交换链描述已填")
+
+    var sc: u64 = 0
+    var dev: u64 = 0
+    var ctx: u64 = 0
+    var fl: u64 = 0
+    let hr: i64 = wcall12(gCreateDevice,
+                          0,                              // pAdapter
+                          D3D_DRIVER_TYPE_HARDWARE as u64,
+                          0,                              // hSoftware
+                          0,                              // Flags
+                          0,                              // pFeatureLevels
+                          0,                              // FeatureLevels
+                          D3D11_SDK_VERSION as u64,
+                          &desc[0] as u64,                // pSwapChainDesc
+                          &sc as u64,                     // ppSwapChain
+                          &dev as u64,                    // ppDevice
+                          &fl as u64,                     // pFeatureLevel
+                          &ctx as u64) as i64             // ppImmediateContext
+    dxLogNum("创建设备 hr", hr)
+    if hr < 0 {
+        dxLog("失败: D3D11CreateDeviceAndSwapChain 返回负值")
+        return false
+    }
+    d->swapChain = sc
+    d->device = dev
+    d->context = ctx
+    标记("B3 device+swapchain ok")
+    dxLog("设备 + 交换链已创建")
+
+    // ---- 取后备缓冲 ----
+    // GetBuffer(Buffer, REFIID riid, void **ppSurface)：
+    // this 占第 1 个实参位，后面 3 个是 Buffer / riid / ppSurface
+    var tex: u64 = 0
+    let mGet: u64 = 方法(sc, SC_GET_BUFFER)
+    if mGet == 0 {
+        dxLog("失败: 取不到 IDXGISwapChain::GetBuffer 地址")
+        return false
+    }
+    rtPrint("[step] swapChain=0x")
+    rtPrintHex(sc, 16)
+    rtPrint("  mGet=0x")
+    rtPrintHex(mGet, 16)
+    rtPrintNl()
+    标记("B3a before GetBuffer")
+    let hr2: i64 = wcall4(mGet, sc, 0, &gIidTex2D[0] as u64, &tex as u64) as i64
+    标记("B3b after GetBuffer")
+    dxLogNum("GetBuffer hr", hr2)
+    if hr2 < 0 || tex == 0 {
+        dxLog("失败: GetBuffer")
+        return false
+    }
+    dxLog("后备缓冲已取得")
+
+    // ---- 渲染目标视图 ----
+    let mRtv: u64 = 方法(dev, DEV_CREATE_RENDERTARGET_VIEW)
+    if mRtv == 0 {
+        dxLog("失败: 取不到 ID3D11Device::CreateRenderTargetView 地址")
+        return false
+    }
+    标记("B3c before CreateRTV")
+    var rtv: u64 = 0
+    let hr4: i64 = wcall4(mRtv, dev, tex, 0, &rtv as u64) as i64
+    标记("B3d after CreateRTV")
+    dxRelease(&tex)
+    dxLogNum("CreateRTV hr", hr4)
+    if hr4 < 0 || rtv == 0 {
+        dxLog("失败: CreateRenderTargetView")
+        return false
+    }
+    d->rtv = rtv
+    标记("B4 rtv ok")
+    dxLog("渲染目标视图已创建")
+
+    // ---- 视口（D3D11_VIEWPORT 是 6 个 float = 24 字节）----
+    var vp: [24]u8
+    清零(&vp[0], 24)
+    写u32(&vp[0], 0, 0)                       // TopLeftX = 0.0f
+    写u32(&vp[0], 4, 0)                       // TopLeftY = 0.0f
+    写u32(&vp[0], 8, 浮点码(w as f64))         // Width
+    写u32(&vp[0], 12, 浮点码(h as f64))        // Height
+    写u32(&vp[0], 16, 0)                      // MinDepth = 0.0f
+    写u32(&vp[0], 20, 0x3F800000)             // MaxDepth = 1.0f
+    let mRs: u64 = 方法(ctx, CTX_RS_SET_VIEWPORTS)
+    wcall3(mRs, ctx, 1, &vp[0] as u64)
+    dxLog("视口已设置")
+
+    // ---- 绑定渲染目标 ----
+    let mOm: u64 = 方法(ctx, CTX_OM_SET_RENDER_TARGETS)
+    wcall4(mOm, ctx, 1, &rtv as u64, 0)
+    dxLog("渲染目标已绑定")
+
+    var c0: [4]f32
+    c0[0] = 0.05 as f32
+    c0[1] = 0.06 as f32
+    c0[2] = 0.10 as f32
+    c0[3] = 1.0 as f32
+    dxClearColor(d, &c0[0])
+    dxPresent(d)
+    标记("B5 first frame presented")
+    dxLog("首帧已呈现")
+    return true
+}
+
+/// 把一个 f64 转成 IEEE-754 单精度位模式（视口参数是 float，只能手写位模式）
+pub fn 浮点码(v: f64) -> u32 {
+    if v == 0.0 {
+        return 0
+    }
+    var x: f64 = v
+    var neg: bool = false
+    if x < 0.0 {
+        neg = true
+        x = 0.0 - x
+    }
+    var e: i32 = 0
+    while x >= 2.0 {
+        x = x / 2.0
+        e = e + 1
+    }
+    while x < 1.0 {
+        x = x * 2.0
+        e = e - 1
+    }
+    // x ∈ [1,2)
+    var m: u32 = 0
+    var i: i32 = 0
+    x = x - 1.0
+    while i < 23 {
+        x = x * 2.0
+        m = m << 1
+        if x >= 1.0 {
+            m = m | 1
+            x = x - 1.0
+        }
+        i = i + 1
+    }
+    let exp: u32 = (e + 127) as u32
+    var bits: u32 = (exp << 23) | (m & 0x7FFFFF)
+    if neg {
+        bits = bits | (0x80000000 as u32)
+    }
+    return bits
+}
+
+/// 清屏：ClearRenderTargetView(this, rtv, const FLOAT[4] rgba, 0)
+pub fn dxClearColor(d: *Dx11, rgba: *f32) -> void {
+    if d->rtv == 0 {
+        return
+    }
+    let m: u64 = 方法(d->context, CTX_CLEAR_RENDER_TARGET_VIEW)
+    wcall4(m, d->context, d->rtv, rgba as u64, 0)
+}
+
+pub fn dxPresent(d: *Dx11) -> void {
+    if d->swapChain == 0 {
+        return
+    }
+    let m: u64 = 方法(d->swapChain, SC_PRESENT)
+    wcall3(m, d->swapChain, 1, 0)
+}
+
+pub fn dxDestroy(d: *Dx11) -> void {
+    dxRelease(&d->rtv)
+    dxRelease(&d->context)
+    dxRelease(&d->device)
+    dxRelease(&d->swapChain)
+}
+
+// =============================================================================
+//  几何绘制层：着色器编译 + 顶点缓冲 + 常量缓冲 + 绘制
+// -----------------------------------------------------------------------------
+//  深度缓冲需要额外 5 个 vtable 下标和 3 个结构体，风险高。
+//  凸多面体改用「画家算法」：按面心深度从远到近依次 Draw(count, startVertex)，
+//  只用已验证的 CTX_DRAW，不需要 DSV。
+// =============================================================================
+
+pub const DXGI_FORMAT_R32G32B32_FLOAT: u32 = 6
+pub const D3D11_USAGE_DEFAULT: u32 = 0
+pub const D3D11_USAGE_DYNAMIC: u32 = 2
+pub const D3D11_BIND_VERTEX_BUFFER: u32 = 0x1
+pub const D3D11_BIND_CONSTANT_BUFFER: u32 = 0x4
+pub const D3D11_CPU_ACCESS_WRITE: u32 = 0x10000
+pub const D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST: u32 = 4
+
+var gCompile: u64 = 0
+var gMapLogged: bool = false
+var gMapLogged2: bool = false
+var gMatLogged: bool = false
+
+fn 长(s: *u8) -> u64 {
+    var i: u64 = 0
+    while s[i] != 0 {
+        i = i + 1
+    }
+    return i
+}
+
+fn 读ptr(p: *u8, off: i32) -> u64 {
+    var v: u64 = 0
+    var i: i32 = 7
+    while i >= 0 {
+        v = v << 8
+        v = v | (p[off + i] as u64)
+        i = i - 1
+    }
+    return v
+}
+
+/// 加载 d3dcompiler_*.dll 并取 D3DCompile
+fn dxLoadCompiler() -> bool {
+    if gCompile != 0 {
+        return true
+    }
+    var h: u64 = 加载DLL("d3dcompiler_47.dll")
+    if h == 0 {
+        h = 加载DLL("d3dcompiler_46.dll")
+    }
+    if h == 0 {
+        h = 加载DLL("d3dcompiler_43.dll")
+    }
+    if h == 0 {
+        dxLog("失败: 找不到 d3dcompiler_*.dll")
+        return false
+    }
+    gCompile = peExport(h, "D3DCompile")
+    if gCompile == 0 {
+        dxLog("失败: 找不到 D3DCompile 导出")
+        return false
+    }
+    标记("C2 d3dcompiler ok")
+    dxLog("d3dcompiler 已解析")
+    return true
+}
+
+/// 编译一段 HLSL，返回 ID3DBlob（失败返回 0）
+fn dxCompile(src: *u8, entry: *u8, target: *u8) -> u64 {
+    if !dxLoadCompiler() {
+        return 0
+    }
+    var code: u64 = 0
+    var errs: u64 = 0
+    // D3DCompile(pSrcData, Size, pSourceName, pDefines, pInclude, pEntry, pTarget,
+    //            Flags1, Flags2, ppCode, ppErrMsgs) = 11 参
+    let hr: i64 = wcall12(gCompile, src as u64, 长(src), 0, 0, 0,
+                          entry as u64, target as u64, 0, 0,
+                          &code as u64, &errs as u64, 0) as i64
+    dxLogNum("D3DCompile hr", hr)
+    if hr < 0 || code == 0 {
+        dxLog("失败: 着色器编译")
+        if errs != 0 {
+            let etxt: *u8 = blobPtr(errs) as *u8
+            if (etxt as u64) != 0 {
+                dxLog("编译错误: ")
+                dxLog(etxt)
+            }
+            dxRelease(&errs)
+        }
+        return 0
+    }
+    if errs != 0 {
+        dxRelease(&errs)
+    }
+    return code
+}
+
+/// ID3DBlob: 3 = GetBufferPointer, 4 = GetBufferSize
+fn blobPtr(b: u64) -> u64 {
+    return wcall1(方法(b, 3), b)
+}
+
+fn blobSize(b: u64) -> u64 {
+    return wcall1(方法(b, 4), b)
+}
+
+/// 绘制用的资源集合
+pub struct Geom {
+    layout: u64
+    vs: u64
+    ps: u64
+    vb: u64
+    cb: u64
+    stride: i32
+    count: i32
+    pSys: u64       // 创建顶点缓冲时上传的源指针（诊断用）
+}
+
+/// 立方体几何：36 顶点（6 面 × 2 三角 × 3 顶点），每顶点 位置3f + 颜色3f
+/// verts 由调用者提供（长度 216 个 f32）
+pub fn dxMakeGeom(d: *Dx11, g: *Geom, verts: *f32, vcount: i32) -> bool {
+    g->layout = 0
+    g->vs = 0
+    g->ps = 0
+    g->vb = 0
+    g->cb = 0
+    g->stride = 24
+    g->count = vcount
+    g->pSys = verts as u64
+
+    // ---- 编译着色器 ----
+    // 隔离测试：忽略矩阵，直接把顶点位置缩放到 NDC 输出（z=0.5 居中）。
+    // 立方体尺寸 2（-1..1），×0.4 → -0.4..0.4，正好落在画面中央。
+    let vsSrc: *u8 = "struct I{float3 p:POSITION;float3 c:COLOR;};struct O{float4 p:SV_POSITION;float3 c:COLOR;};O VSMain(I i){O o;o.p=float4(i.p*0.4,1.0);o.c=i.c;return o;}"
+    // 诊断期输出纯白：无论背景是什么颜色都能看见几何有没有画出来
+    let psSrc: *u8 = "float4 PSMain(float4 p:SV_POSITION,float3 c:COLOR):SV_TARGET{return float4(1.0,1.0,1.0,1.0);}"
+
+    let vsb: u64 = dxCompile(vsSrc, "VSMain", "vs_4_0")
+    if vsb == 0 {
+        return false
+    }
+    let psb: u64 = dxCompile(psSrc, "PSMain", "ps_4_0")
+    if psb == 0 {
+        dxRelease(&vsb)
+        return false
+    }
+    标记("C3 shaders compiled")
+    dxLog("着色器已编译")
+
+    // ---- 创建着色器对象 ----
+    var vs: u64 = 0
+    var ps: u64 = 0
+    // CreateVertexShader(this, pBytecode, BytecodeLength, pClassLinkage, ppVS)
+    let hrVs: i64 = wcall5(方法(d->device, DEV_CREATE_VERTEX_SHADER),
+                           d->device, blobPtr(vsb), blobSize(vsb), 0, &vs as u64) as i64
+    let hrPs: i64 = wcall5(方法(d->device, DEV_CREATE_PIXEL_SHADER),
+                           d->device, blobPtr(psb), blobSize(psb), 0, &ps as u64) as i64
+    dxLogNum("CreateVertexShader hr", hrVs)
+    dxLogNum("CreatePixelShader hr", hrPs)
+    if hrVs < 0 || hrPs < 0 || vs == 0 || ps == 0 {
+        dxLog("失败: CreateVertexShader / CreatePixelShader")
+        dxRelease(&vsb)
+        dxRelease(&psb)
+        return false
+    }
+    g->vs = vs
+    g->ps = ps
+
+    // ---- 输入布局 ----
+    var elems: [64]u8
+    清零(&elems[0], 64)
+    // 元素 0：POSITION, R32G32B32_FLOAT, slot0, offset0
+    写ptr(&elems[0], 0, "POSITION" as u64)
+    写u32(&elems[0], 8, 0)
+    写u32(&elems[0], 12, DXGI_FORMAT_R32G32B32_FLOAT)
+    写u32(&elems[0], 16, 0)
+    写u32(&elems[0], 20, 0)
+    写u32(&elems[0], 24, 0)
+    写u32(&elems[0], 28, 0)
+    // 元素 1：COLOR, offset 12
+    写ptr(&elems[0], 32, "COLOR" as u64)
+    写u32(&elems[0], 40, 0)
+    写u32(&elems[0], 44, DXGI_FORMAT_R32G32B32_FLOAT)
+    写u32(&elems[0], 48, 0)
+    写u32(&elems[0], 52, 12)
+    写u32(&elems[0], 56, 0)
+    写u32(&elems[0], 60, 0)
+
+    var lay: u64 = 0
+    // CreateInputLayout(this, pInputElementDescs, NumElements, pShaderBytecode, BytecodeLength, ppLayout)
+    let hrLay: i64 = wcall6(方法(d->device, DEV_CREATE_INPUT_LAYOUT),
+                            d->device, &elems[0] as u64, 2,
+                            blobPtr(vsb), blobSize(vsb), &lay as u64) as i64
+    dxRelease(&vsb)
+    dxRelease(&psb)
+    dxLogNum("CreateInputLayout hr", hrLay)
+    if hrLay < 0 || lay == 0 {
+        dxLog("失败: CreateInputLayout")
+        return false
+    }
+    g->layout = lay
+    标记("C4 layout ok")
+    dxLog("输入布局已创建")
+
+    // ---- 顶点缓冲 ----
+    var bd: [24]u8
+    清零(&bd[0], 24)
+    写u32(&bd[0], 0, (vcount * 24) as u32)          // ByteWidth
+    写u32(&bd[0], 4, D3D11_USAGE_DEFAULT)
+    写u32(&bd[0], 8, D3D11_BIND_VERTEX_BUFFER)
+    写u32(&bd[0], 12, 0)                            // CPUAccessFlags
+    写u32(&bd[0], 16, 0)                            // MiscFlags
+    // StructureByteStride：只有「结构化缓冲」才填，普通顶点缓冲必须为 0，
+    // 否则 CreateBuffer 返回 E_INVALIDARG。
+    写u32(&bd[0], 20, 0)
+
+    var init: [16]u8
+    清零(&init[0], 16)
+    写ptr(&init[0], 0, verts as u64)                // pSysMem
+    写u32(&init[0], 8, 0)
+    写u32(&init[0], 12, 0)
+
+    var vb: u64 = 0
+    let hrVb: i64 = wcall4(方法(d->device, DEV_CREATE_BUFFER),
+                           d->device, &bd[0] as u64, &init[0] as u64, &vb as u64) as i64
+    dxLogNum("CreateBuffer(VB) hr", hrVb)
+    if hrVb < 0 || vb == 0 {
+        dxLog("失败: CreateBuffer(顶点)")
+        return false
+    }
+    g->vb = vb
+    dxLog("顶点缓冲已创建")
+
+    // ---- 常量缓冲（16 个 float = 64 字节，动态可写）----
+    清零(&bd[0], 24)
+    写u32(&bd[0], 0, 64)
+    写u32(&bd[0], 4, D3D11_USAGE_DYNAMIC)
+    写u32(&bd[0], 8, D3D11_BIND_CONSTANT_BUFFER)
+    写u32(&bd[0], 12, D3D11_CPU_ACCESS_WRITE)
+    写u32(&bd[0], 16, 0)
+    写u32(&bd[0], 20, 0)
+
+    var cb: u64 = 0
+    let hrCb: i64 = wcall4(方法(d->device, DEV_CREATE_BUFFER),
+                           d->device, &bd[0] as u64, 0, &cb as u64) as i64
+    dxLogNum("CreateBuffer(CB) hr", hrCb)
+    if hrCb < 0 || cb == 0 {
+        dxLog("失败: CreateBuffer(常量)")
+        return false
+    }
+    g->cb = cb
+    标记("C5 geom ok")
+    dxLog("常量缓冲已创建")
+
+    // 诊断：缓冲句柄与上传源指针
+    rtPrint("[dbg] vb=0x")
+    rtPrintHex(vb, 16)
+    rtPrint(" cb=0x")
+    rtPrintHex(cb, 16)
+    rtPrint(" pSys=0x")
+    rtPrintHex(verts as u64, 16)
+    rtPrint(" bytes=")
+    rtPrintI64((vcount * 24) as i64)
+    rtPrintNl()
+    return true
+}
+
+/// 把 4x4 矩阵（列主序 f64[16]）写入常量缓冲
+pub fn dxUpdateMatrix(d: *Dx11, g: *Geom, m: *f64) -> void {
+    if g->cb == 0 {
+        return
+    }
+    var mapped: [16]u8
+    清零(&mapped[0], 16)
+    // Map(this, pResource, Subresource, MapType, MapFlags, pMappedResource)
+    let hr: i64 = wcall6(方法(d->context, CTX_MAP), d->context, g->cb, 0,
+                         D3D11_MAP_WRITE_DISCARD as u64, 0, &mapped[0] as u64) as i64
+    if !gMapLogged {
+        gMapLogged = true
+        rtPrint("[step] map hr=")
+        rtPrintI64(hr)
+        rtPrintNl()
+    }
+    if hr < 0 {
+        return
+    }
+    let pdata: *f32 = 读ptr(&mapped[0], 0) as *f32
+    if (pdata as u64) == 0 {
+        if !gMapLogged2 {
+            gMapLogged2 = true
+            rtPrint("[step] map pData=NULL\n")
+        }
+        return
+    }
+    var i: i32 = 0
+    while i < 16 {
+        pdata[i] = m[i] as f32
+        i = i + 1
+    }
+    wcall3(方法(d->context, CTX_UNMAP), d->context, g->cb, 0)
+
+    // 只在第一帧打印矩阵关键元素（×1000 转整数，避免 ASCII 输出浮点）
+    if !gMatLogged {
+        gMatLogged = true
+        rtPrint("[step] m0=")
+        rtPrintI64((m[0] * 1000.0) as i64)
+        rtPrint(" m5=")
+        rtPrintI64((m[5] * 1000.0) as i64)
+        rtPrint(" m10=")
+        rtPrintI64((m[10] * 1000.0) as i64)
+        rtPrint(" m14=")
+        rtPrintI64((m[14] * 1000.0) as i64)
+        rtPrintNl()
+    }
+}
+
+/// 绑定输入布局 / 拓扑 / 顶点缓冲 / 着色器 / 常量缓冲
+pub fn dxBindGeom(d: *Dx11, g: *Geom) -> void {
+    let ctx: u64 = d->context
+    wcall2(方法(ctx, CTX_IA_SET_INPUT_LAYOUT), ctx, g->layout)
+    wcall2(方法(ctx, CTX_IA_SET_PRIMITIVE_TOPOLOGY), ctx,
+           D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST as u64)
+
+    var strideArr: [1]u32
+    strideArr[0] = g->stride as u32
+    var offArr: [1]u32
+    offArr[0] = 0
+    var vbs: [1]u64
+    vbs[0] = g->vb
+    // IASetVertexBuffers(this, StartSlot, NumBuffers, ppVB, pStrides, pOffsets)
+    wcall6(方法(ctx, CTX_IA_SET_VERTEX_BUFFERS), ctx, 0, 1,
+           &vbs[0] as u64, &strideArr[0] as u64, &offArr[0] as u64)
+
+    // VSSetShader(this, pVS, ppClassInstances, NumClassInstances)
+    wcall4(方法(ctx, CTX_VS_SET_SHADER), ctx, g->vs, 0, 0)
+    // PSSetShader(this, pPS, ppClassInstances, NumClassInstances)
+    wcall4(方法(ctx, CTX_PS_SET_SHADER), ctx, g->ps, 0, 0)
+
+    var cbs: [1]u64
+    cbs[0] = g->cb
+    // VSSetConstantBuffers(this, StartSlot, NumBuffers, ppCB)
+    wcall4(方法(ctx, CTX_VS_SET_CONSTANT_BUFFERS), ctx, 0, 1, &cbs[0] as u64)
+}
+
+/// 绘制 [start, start+count) 范围的顶点
+pub fn dxDrawRange(d: *Dx11, start: i32, count: i32) -> void {
+    wcall3(方法(d->context, CTX_DRAW), d->context, count as u64, start as u64)
+}
+
+// ---------------------------------------------------------------- 标题栏诊断
+// 控制台会被关闭、对话框可能被忽略，但窗口标题栏一直可见。
+// 把关键句柄的十进制值写进标题，用户直接念数字即可。
+
+fn 追加串(b: *u8, n: *u64, s: *u8) -> void {
+    var i: u64 = 0
+    while s[i] != 0 {
+        b[*n] = s[i]
+        *n = *n + 1
+        i = i + 1
+    }
+}
+
+fn 追加数(b: *u8, n: *u64, v: u64) -> void {
+    var d: [24]u8
+    var dn: u64 = 0
+    var x: u64 = v
+    if x == 0 {
+        d[0] = 48
+        dn = 1
+    } else {
+        while x > 0 {
+            d[dn] = (48 + (x % 10) as i32) as u8
+            dn = dn + 1
+            x = x / 10
+        }
+    }
+    while dn > 0 {
+        dn = dn - 1
+        b[*n] = d[dn]
+        *n = *n + 1
+    }
+}
+
+pub fn dxDiagTitle(hwnd: u64, g: *Geom) -> void {
+    var b: [256]u8
+    var n: u64 = 0
+    追加串(&b[0], &n, "vb=")
+    追加数(&b[0], &n, g->vb)
+    追加串(&b[0], &n, " cb=")
+    追加数(&b[0], &n, g->cb)
+    追加串(&b[0], &n, " lay=")
+    追加数(&b[0], &n, g->layout)
+    追加串(&b[0], &n, " ps=")
+    追加数(&b[0], &n, g->pSys)
+    追加串(&b[0], &n, " n=")
+    追加数(&b[0], &n, g->count as u64)
+    b[n] = 0
+    winSetTitle(hwnd, &b[0])
+}
+
+// ---------------------------------------------------------------- 最小三角形
+// 完全不依赖顶点缓冲 / 输入布局 / 常量缓冲：
+//   VS 用 SV_VertexID 直接给出三个 NDC 顶点
+// 这条路径只用到 设备 + 交换链 + RTV + 视口 + 两个着色器 + Draw + Present。
+// 用来把「基础管线」和「顶点数据路径」彻底分开。
+
+pub fn dxMakeTri(d: *Dx11, g: *Geom) -> bool {
+    g->vs = 0
+    g->ps = 0
+    let vsSrc: *u8 = "float4 VSMain(uint id:SV_VertexID):SV_POSITION{float x=-0.7;float y=-0.7;if(id==1){x=0.7;}if(id==2){x=0.0;y=0.7;}return float4(x,y,0.5,1.0);}"
+    let psSrc: *u8 = "float4 PSMain():SV_TARGET{return float4(1.0,0.8,0.0,1.0);}"
+
+    let vsb: u64 = dxCompile(vsSrc, "VSMain", "vs_4_0")
+    if vsb == 0 {
+        return false
+    }
+    let psb: u64 = dxCompile(psSrc, "PSMain", "ps_4_0")
+    if psb == 0 {
+        dxRelease(&vsb)
+        return false
+    }
+    var vs: u64 = 0
+    var ps: u64 = 0
+    let hrVs: i64 = wcall5(方法(d->device, DEV_CREATE_VERTEX_SHADER),
+                           d->device, blobPtr(vsb), blobSize(vsb), 0, &vs as u64) as i64
+    let hrPs: i64 = wcall5(方法(d->device, DEV_CREATE_PIXEL_SHADER),
+                           d->device, blobPtr(psb), blobSize(psb), 0, &ps as u64) as i64
+    dxRelease(&vsb)
+    dxRelease(&psb)
+    dxLogNum("tri VS hr", hrVs)
+    dxLogNum("tri PS hr", hrPs)
+    if hrVs < 0 || hrPs < 0 || vs == 0 || ps == 0 {
+        dxLog("失败: 三角形着色器创建")
+        return false
+    }
+    g->vs = vs
+    g->ps = ps
+    标记("T1 tri shaders ok")
+    return true
+}
+
+/// 画一个三角形：只设两个着色器 + Draw(3, 0)
+pub fn dxDrawTri(d: *Dx11, g: *Geom) -> void {
+    wcall4(方法(d->context, CTX_VS_SET_SHADER), d->context, g->vs, 0, 0)
+    wcall4(方法(d->context, CTX_PS_SET_SHADER), d->context, g->ps, 0, 0)
+    wcall3(方法(d->context, CTX_DRAW), d->context, 3, 0)
+}
+
+// ---------------------------------------------------------------- 顶点缓冲三角形
+// 最小顶点缓冲用例：3 个顶点，每顶点 12 字节（仅位置），无矩阵、无常量缓冲。
+// 用来单独验证「顶点缓冲 + 输入布局 + IASetVertexBuffers」这条路径。
+
+var gTriVerts: [9]f32
+
+/// 返回 0=成功，1=VS编译失败，2=PS编译失败，3=着色器对象创建失败，
+/// 4=输入布局失败，5=顶点缓冲失败
+pub fn dxMakeVBTri(d: *Dx11, g: *Geom) -> i32 {
+    g->vs = 0
+    g->ps = 0
+    g->vb = 0
+    g->layout = 0
+    g->stride = 12
+    g->count = 3
+
+    // 三个顶点（NDC）：左下、右下、上方
+    gTriVerts[0] = (0.0 - 0.7) as f32
+    gTriVerts[1] = (0.0 - 0.7) as f32
+    gTriVerts[2] = 0.5 as f32
+    gTriVerts[3] = 0.7 as f32
+    gTriVerts[4] = (0.0 - 0.7) as f32
+    gTriVerts[5] = 0.5 as f32
+    gTriVerts[6] = 0.0 as f32
+    gTriVerts[7] = 0.7 as f32
+    gTriVerts[8] = 0.5 as f32
+
+    let vsSrc: *u8 = "struct I{float3 p:POSITION;};struct O{float4 p:SV_POSITION;};O VSMain(I i){O o;o.p=float4(i.p,1.0);return o;}"
+    let psSrc: *u8 = "float4 PSMain(float4 p:SV_POSITION):SV_TARGET{return float4(1.0,0.8,0.0,1.0);}"
+
+    let vsb: u64 = dxCompile(vsSrc, "VSMain", "vs_4_0")
+    if vsb == 0 {
+        return 1
+    }
+    let psb: u64 = dxCompile(psSrc, "PSMain", "ps_4_0")
+    if psb == 0 {
+        dxRelease(&vsb)
+        return 2
+    }
+    var vs: u64 = 0
+    var ps: u64 = 0
+    let hrVs: i64 = wcall5(方法(d->device, DEV_CREATE_VERTEX_SHADER),
+                           d->device, blobPtr(vsb), blobSize(vsb), 0, &vs as u64) as i64
+    let hrPs: i64 = wcall5(方法(d->device, DEV_CREATE_PIXEL_SHADER),
+                           d->device, blobPtr(psb), blobSize(psb), 0, &ps as u64) as i64
+    if hrVs < 0 || hrPs < 0 || vs == 0 || ps == 0 {
+        dxLog("失败: VB三角形着色器")
+        dxRelease(&vsb)
+        dxRelease(&psb)
+        return 3
+    }
+    g->vs = vs
+    g->ps = ps
+
+    // 输入布局：只有 POSITION，偏移 0
+    var elems: [32]u8
+    清零(&elems[0], 32)
+    写ptr(&elems[0], 0, "POSITION" as u64)
+    写u32(&elems[0], 8, 0)
+    写u32(&elems[0], 12, DXGI_FORMAT_R32G32B32_FLOAT)
+    写u32(&elems[0], 16, 0)
+    写u32(&elems[0], 20, 0)
+    写u32(&elems[0], 24, 0)
+    写u32(&elems[0], 28, 0)
+
+    var lay: u64 = 0
+    let hrLay: i64 = wcall6(方法(d->device, DEV_CREATE_INPUT_LAYOUT),
+                            d->device, &elems[0] as u64, 1,
+                            blobPtr(vsb), blobSize(vsb), &lay as u64) as i64
+    dxRelease(&vsb)
+    dxRelease(&psb)
+    if hrLay < 0 || lay == 0 {
+        dxLog("失败: VB三角形输入布局")
+        return 4
+    }
+    g->layout = lay
+
+    // 顶点缓冲：3 × 12 = 36 字节
+    var bd: [24]u8
+    清零(&bd[0], 24)
+    写u32(&bd[0], 0, 36)
+    写u32(&bd[0], 4, D3D11_USAGE_DEFAULT)
+    写u32(&bd[0], 8, D3D11_BIND_VERTEX_BUFFER)
+    写u32(&bd[0], 12, 0)
+    写u32(&bd[0], 16, 0)
+    写u32(&bd[0], 20, 0)
+
+    var init: [16]u8
+    清零(&init[0], 16)
+    写ptr(&init[0], 0, &gTriVerts[0] as u64)
+
+    var vb: u64 = 0
+    let hrVb: i64 = wcall4(方法(d->device, DEV_CREATE_BUFFER),
+                           d->device, &bd[0] as u64, &init[0] as u64, &vb as u64) as i64
+    dxLogNum("VBtri CreateBuffer hr", hrVb)
+    if hrVb < 0 || vb == 0 {
+        dxLog("失败: VB三角形顶点缓冲")
+        return 5
+    }
+    g->vb = vb
+    标记("T2 VB tri ready")
+    return 0
+}
+
+pub fn dxDrawVBTri(d: *Dx11, g: *Geom) -> void {
+    let ctx: u64 = d->context
+    wcall2(方法(ctx, CTX_IA_SET_INPUT_LAYOUT), ctx, g->layout)
+    wcall2(方法(ctx, CTX_IA_SET_PRIMITIVE_TOPOLOGY), ctx,
+           D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST as u64)
+    var strideArr: [1]u32
+    strideArr[0] = g->stride as u32
+    var offArr: [1]u32
+    offArr[0] = 0
+    var vbs: [1]u64
+    vbs[0] = g->vb
+    wcall6(方法(ctx, CTX_IA_SET_VERTEX_BUFFERS), ctx, 0, 1,
+           &vbs[0] as u64, &strideArr[0] as u64, &offArr[0] as u64)
+    wcall4(方法(ctx, CTX_VS_SET_SHADER), ctx, g->vs, 0, 0)
+    wcall4(方法(ctx, CTX_PS_SET_SHADER), ctx, g->ps, 0, 0)
+    wcall3(方法(ctx, CTX_DRAW), ctx, 3, 0)
+}
+
+pub fn dxDestroyGeom(g: *Geom) -> void {
+    dxRelease(&g->cb)
+    dxRelease(&g->vb)
+    dxRelease(&g->layout)
+    dxRelease(&g->ps)
+    dxRelease(&g->vs)
+}

@@ -1,0 +1,11 @@
+// libtcrt —— TC64 运行时库入口（对标 mingw 的 -ltcrt）
+//
+// 用法：用户源码里写
+//     import "libtcrt.tc";
+// 即等价于 mingw 的 -ltcrt，由 <root>\lib 搜索根解析。
+//
+// 说明：TC 是整程序编译，没有目标文件与链接器，所以"库"以
+//       "单一入口源文件"的形式提供，而非 .a 归档。
+module libtcrt;
+
+import "tcrt/rt.tc";

@@ -1,0 +1,11 @@
+// libtccore —— TC64 核心库入口：动态数组 / 格式化 / 字符串 / 驻留表 / 映射
+//
+// 用法：import "libtccore.tc";
+module libtccore;
+
+import "tcrt/rt.tc";
+import "tclib/core/vec.tc";
+import "tclib/core/fmt.tc";
+import "tclib/core/str.tc";
+import "tclib/core/intern.tc";
+import "tclib/core/map.tc";

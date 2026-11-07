@@ -1,0 +1,275 @@
+// =============================================================================
+//  examples/38_gpu/cube.tc — GPU 旋转立方体（OpenGL 1.1）
+// -----------------------------------------------------------------------------
+//  真正的显卡渲染：顶点变换、光栅化、深度测试全部由 GPU 完成，
+//  CPU 只负责每帧算两个矩阵 + 提交 36 个顶点。
+//
+//  编译（必须用 tcc3，见 docs/ROADMAP.md 的编译器选型定案）：
+//      build\tcc3.exe examples\38_gpu\cube.tc -o examples\38_gpu\cube.exe
+//
+//  运行：窗口出现后立方体持续旋转，关窗口退出。
+// =============================================================================
+
+module gpu_cube
+
+import "tcrt/rt.tc"
+import "tclib/win/win32.tc"
+import "tclib/gfx/gl.tc"
+
+var gRunning: bool = true
+
+fn 过程(h: u64, msg: u32, wp: u64, lp: i64) -> i64 {
+    if msg == 0x0010 {          // WM_CLOSE
+        gRunning = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    if msg == 0x0002 {          // WM_DESTROY
+        gRunning = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    return wcall4(gWin.defWindowProcW, h, msg as u64, wp, lp as u64) as i64
+}
+
+// ---------------------------------------------------------------- 几何数据
+// 36 个顶点（6 面 × 2 三角形 × 3 顶点），每顶点 3 个 float
+var gPos: [108]f32
+var gCol: [108]f32
+var gNrm: [108]f32
+
+fn 写顶点(i: i32, x: f64, y: f64, z: f64,
+           r: f64, g: f64, b: f64,
+           nx: f64, ny: f64, nz: f64) -> void {
+    let k: i32 = i * 3
+    gPos[k]     = x as f32
+    gPos[k + 1] = y as f32
+    gPos[k + 2] = z as f32
+    gCol[k]     = r as f32
+    gCol[k + 1] = g as f32
+    gCol[k + 2] = b as f32
+    gNrm[k]     = nx as f32
+    gNrm[k + 1] = ny as f32
+    gNrm[k + 2] = nz as f32
+}
+
+/// 展开立方体：8 个角 + 6 个面的 4 角索引 + 每面颜色
+fn 建立立方体() -> void {
+    // 角点：索引 0..7，符号组合
+    var cx: [8]f64
+    var cy: [8]f64
+    var cz: [8]f64
+    // -1 / +1 组合，顺序与下面索引表保持一致
+    cx[0] = 0.0 - 1.0; cy[0] = 0.0 - 1.0; cz[0] = 1.0    // 0 前下左
+    cx[1] = 1.0;       cy[1] = 0.0 - 1.0; cz[1] = 1.0    // 1 前下右
+    cx[2] = 1.0;       cy[2] = 1.0;       cz[2] = 1.0    // 2 前上右
+    cx[3] = 0.0 - 1.0; cy[3] = 1.0;       cz[3] = 1.0    // 3 前上左
+    cx[4] = 1.0;       cy[4] = 0.0 - 1.0; cz[4] = 0.0 - 1.0 // 4 后下右
+    cx[5] = 0.0 - 1.0; cy[5] = 0.0 - 1.0; cz[5] = 0.0 - 1.0 // 5 后下左
+    cx[6] = 0.0 - 1.0; cy[6] = 1.0;       cz[6] = 0.0 - 1.0 // 6 后上左
+    cx[7] = 1.0;       cy[7] = 1.0;       cz[7] = 0.0 - 1.0 // 7 后上右
+
+    // 每面 4 个角（逆时针，从外面看）
+    var fi: [24]i32
+    fi[0] = 0;  fi[1] = 1;  fi[2] = 2;  fi[3] = 3   // 前  +z
+    fi[4] = 1;  fi[5] = 4;  fi[6] = 7;  fi[7] = 2   // 右  +x
+    fi[8] = 4;  fi[9] = 5;  fi[10] = 6; fi[11] = 7  // 后  -z
+    fi[12] = 5; fi[13] = 0; fi[14] = 3; fi[15] = 6  // 左  -x
+    fi[16] = 3; fi[17] = 2; fi[18] = 7; fi[19] = 6  // 上  +y
+    fi[20] = 5; fi[21] = 4; fi[22] = 1; fi[23] = 0  // 下  -y
+
+    // 每面颜色（红 绿 蓝 黄 品红 青）
+    var fc: [18]f64
+    fc[0] = 1.0;  fc[1] = 0.2;  fc[2] = 0.2
+    fc[3] = 0.2;  fc[4] = 1.0;  fc[5] = 0.2
+    fc[6] = 0.2;  fc[7] = 0.4;  fc[8] = 1.0
+    fc[9] = 1.0;  fc[10] = 1.0; fc[11] = 0.2
+    fc[12] = 1.0; fc[13] = 0.2; fc[14] = 1.0
+    fc[15] = 0.2; fc[16] = 1.0; fc[17] = 1.0
+
+    // 每面法线（与上面的面顺序一一对应）
+    var fnm: [18]f64
+    fnm[0] = 0.0;  fnm[1] = 0.0;  fnm[2] = 1.0    // 前 +z
+    fnm[3] = 1.0;  fnm[4] = 0.0;  fnm[5] = 0.0    // 右 +x
+    fnm[6] = 0.0;  fnm[7] = 0.0;  fnm[8] = 0.0 - 1.0  // 后 -z
+    fnm[9] = 0.0 - 1.0; fnm[10] = 0.0; fnm[11] = 0.0  // 左 -x
+    fnm[12] = 0.0; fnm[13] = 1.0; fnm[14] = 0.0   // 上 +y
+    fnm[15] = 0.0; fnm[16] = 0.0 - 1.0; fnm[17] = 0.0 // 下 -y
+
+    var face: i32 = 0
+    var out: i32 = 0
+    while face < 6 {
+        let c0: i32 = fi[face * 4]
+        let c1: i32 = fi[face * 4 + 1]
+        let c2: i32 = fi[face * 4 + 2]
+        let c3: i32 = fi[face * 4 + 3]
+        let r: f64 = fc[face * 3]
+        let g: f64 = fc[face * 3 + 1]
+        let b: f64 = fc[face * 3 + 2]
+        let nx: f64 = fnm[face * 3]
+        let ny: f64 = fnm[face * 3 + 1]
+        let nz: f64 = fnm[face * 3 + 2]
+        // 三角形 1: c0 c1 c2
+        写顶点(out, cx[c0], cy[c0], cz[c0], r, g, b, nx, ny, nz); out = out + 1
+        写顶点(out, cx[c1], cy[c1], cz[c1], r, g, b, nx, ny, nz); out = out + 1
+        写顶点(out, cx[c2], cy[c2], cz[c2], r, g, b, nx, ny, nz); out = out + 1
+        // 三角形 2: c0 c2 c3
+        写顶点(out, cx[c0], cy[c0], cz[c0], r, g, b, nx, ny, nz); out = out + 1
+        写顶点(out, cx[c2], cy[c2], cz[c2], r, g, b, nx, ny, nz); out = out + 1
+        写顶点(out, cx[c3], cy[c3], cz[c3], r, g, b, nx, ny, nz); out = out + 1
+        face = face + 1
+    }
+}
+
+// ---------------------------------------------------------------- 矩阵
+
+/// 透视矩阵，列主序（OpenGL 约定）
+fn 透视矩阵(m: *f32, aspect: f64, near: f64, far: f64) -> void {
+    // fov = 60° → tan(30°) = 0.5773502691896258
+    let f: f64 = 1.0 / 0.5773502691896258
+    var i: i32 = 0
+    while i < 16 {
+        m[i] = 0.0 as f32
+        i = i + 1
+    }
+    m[0] = (f / aspect) as f32
+    m[5] = f as f32
+    m[10] = ((far + near) / (near - far)) as f32
+    m[11] = 0.0 as f32 - 1.0 as f32
+    m[14] = ((2.0 * far * near) / (near - far)) as f32
+    m[15] = 0.0 as f32
+}
+
+/// 模型视图矩阵 = 平移(0,0,-3.5) * Rx(ax) * Ry(ay)，列主序
+fn 模型视图(f: f32, m: *f32, ax: f64, ay: f64) -> void {
+    let cx: f64 = cos(ax)
+    let sx: f64 = sin(ax)
+    let cy: f64 = cos(ay)
+    let sy: f64 = sin(ay)
+    // M = Rx * Ry（行主序推导，写入时转列主序）
+    let m00: f64 = cy
+    let m01: f64 = 0.0
+    let m02: f64 = sy
+    let m10: f64 = sx * sy
+    let m11: f64 = cx
+    let m12: f64 = 0.0 - sx * cy
+    let m20: f64 = 0.0 - cx * sy
+    let m21: f64 = sx
+    let m22: f64 = cx * cy
+    m[0] = m00 as f32;  m[1] = m10 as f32;  m[2] = m20 as f32;  m[3] = 0.0 as f32
+    m[4] = m01 as f32;  m[5] = m11 as f32;  m[6] = m21 as f32;  m[7] = 0.0 as f32
+    m[8] = m02 as f32;  m[9] = m12 as f32;  m[10] = m22 as f32; m[11] = 0.0 as f32
+    m[12] = 0.0 as f32; m[13] = 0.0 as f32; m[14] = 0.0 as f32 - 3.5 as f32
+    m[15] = 1.0 as f32
+}
+
+// ---------------------------------------------------------------- 主流程
+
+fn main() -> i32 {
+    if !rtInit() {
+        return 1
+    }
+    if !winInit() {
+        rtPrint("[FAIL] winInit\n")
+        return 2
+    }
+    if !glLoadAll() {
+        rtPrint("[FAIL] 无法加载 opengl32.dll 或其导出\n")
+        return 3
+    }
+    建立立方体()
+
+    if !winRegisterClassEx("GPUCube", 过程, 0, 0x00FFFFFF) {
+        rtPrint("[FAIL] 注册窗口类失败\n")
+        return 4
+    }
+    let w: i32 = 720
+    let h: i32 = 560
+    let hwnd: u64 = winCreateWindowFramed("GPUCube", "GPU 立方体（OpenGL 1.1）", w, h)
+    if hwnd == 0 {
+        rtPrint("[FAIL] 创建窗口失败\n")
+        return 5
+    }
+    winShow(hwnd, SW_SHOW)
+
+    if !glAttach(hwnd, w, h) {
+        rtPrint("[FAIL] 创建 GL 上下文失败\n")
+        return 6
+    }
+    rtPrint("[OK] GPU 上下文已建立\n")
+    let ver: *u8 = glVersion()
+    if ver != 0 {
+        rtPrint("GL 版本: ")
+        rtPrint(ver)
+        rtPrintNl()
+    }
+
+    // ---- 光照 ----
+    // 注意：GL_POSITION 会按「调用时的 MODELVIEW」变换，所以必须在单位矩阵下设置。
+    var lp: [4]f32       // 光源位置，w=0 → 方向光
+    lp[0] = 0.5 as f32
+    lp[1] = 0.8 as f32
+    lp[2] = 1.0 as f32
+    lp[3] = 0.0 as f32
+    var ld: [4]f32       // 漫反射：白
+    ld[0] = 1.0 as f32
+    ld[1] = 1.0 as f32
+    ld[2] = 1.0 as f32
+    ld[3] = 1.0 as f32
+    var la: [4]f32       // 光源环境分量：小
+    la[0] = 0.10 as f32
+    la[1] = 0.10 as f32
+    la[2] = 0.12 as f32
+    la[3] = 1.0 as f32
+    var lma: [4]f32      // 场景全局环境光
+    lma[0] = 0.18 as f32
+    lma[1] = 0.18 as f32
+    lma[2] = 0.22 as f32
+    lma[3] = 1.0 as f32
+    var ms: [4]f32       // 材质高光
+    ms[0] = 0.55 as f32
+    ms[1] = 0.55 as f32
+    ms[2] = 0.60 as f32
+    ms[3] = 1.0 as f32
+    var msh: [4]f32      // 高光指数（只用 [0]）
+    msh[0] = 32.0 as f32
+    msh[1] = 0.0 as f32
+    msh[2] = 0.0 as f32
+    msh[3] = 0.0 as f32
+
+    glLightModelAmbient(&lma[0])
+    glLight0(GL_POSITION, &lp[0])
+    glLight0(GL_DIFFUSE, &ld[0])
+    glLight0(GL_AMBIENT, &la[0])
+    glMaterial(GL_SPECULAR, &ms[0])
+    glMaterial(GL_SHININESS, &msh[0])
+    glLightingOn()
+
+    var proj: [16]f32
+    var mv: [16]f32
+    透视矩阵(&proj[0], 720.0 / 560.0, 0.1, 100.0)
+
+    var ay: f64 = 0.0
+    var ax: f64 = 0.35
+
+    while winPump() && gRunning {
+        if keyDown(27) {        // ESC 退出
+            break
+        }
+        // 每帧：算矩阵 → 清屏 → 提交顶点 → 推送
+        模型视图(0.0 as f32, &mv[0], ax, ay)
+        glClearAll()
+        glSetPerspective(&proj[0])
+        glSetModelView(&mv[0])
+        glVerts(&gPos[0], 12)
+        glColors(&gCol[0], 12)
+        glNormals(&gNrm[0], 12)
+        glDraw(36)
+        glPresent()
+        ay = ay + 0.02
+        winSleep(16)
+    }
+
+    glDetach()
+    return 0
+}

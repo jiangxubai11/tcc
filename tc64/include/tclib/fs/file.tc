@@ -1,0 +1,162 @@
+// =============================================================================
+//  tclib/fs/file.tc — 文件系统封装
+// -----------------------------------------------------------------------------
+//  在 tcrt 的原生文件 I/O 之上提供高层接口：
+//    · 整文件读写（读写一体，自动创建/截断）
+//    · 追加（读入 + 重写，简化实现）
+//    · 存在性检查、路径拼接
+//    · 目录创建（NtCreateFile + FILE_DIRECTORY_FILE）
+//  实现只依赖 tcrt，不导入任何 DLL。
+// =============================================================================
+
+module tc.fs.file;
+
+import "../../tcrt/sys/nt.tc";
+import "../../tcrt/core/mem.tc";
+import "../../tcrt/core/io.tc";
+
+const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC0000035 as i32;
+
+// ---------------------------------------------------------------------------
+//  整文件读写
+// ---------------------------------------------------------------------------
+
+/// 读取整个文件。返回区块分配器上的缓冲（末尾 NUL），长度写入 outLen；
+/// 失败返回 null。
+pub fn fsReadAll(path: *u8, outLen: *u64) -> *u8 {
+    return rtReadWholeFile(path, outLen);
+}
+
+/// 写入整个文件（不存在则创建，存在则截断）。成功返回 true。
+pub fn fsWriteAll(path: *u8, data: *u8, n: u64) -> bool {
+    let f: File = rtFileCreate(path);
+    if !f.ok {
+        return false;
+    }
+    let wrote: u64 = rtFileWrite(&f, data, n);
+    rtFileClose(&f);
+    return wrote == n;
+}
+
+/// 追加写入。文件不存在时等价于 fsWriteAll。
+pub fn fsAppend(path: *u8, data: *u8, n: u64) -> bool {
+    var oldLen: u64 = 0;
+    let old: *u8 = rtReadWholeFile(path, &oldLen);
+    if (old as u64) == 0 {
+        return fsWriteAll(path, data, n);
+    }
+    let total: u64 = oldLen + n;
+    let buf: *u8 = rtAlloc(total, 16);
+    if (buf as u64) == 0 {
+        return false;
+    }
+    rtMemCopy(buf, old, oldLen);
+    rtMemCopy(buf + oldLen, data, n);
+    return fsWriteAll(path, buf, total);
+}
+
+/// 文件是否存在（且可读）
+pub fn fsExists(path: *u8) -> bool {
+    let f: File = rtFileOpen(path);
+    if !f.ok {
+        return false;
+    }
+    rtFileClose(&f);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+//  路径
+// ---------------------------------------------------------------------------
+
+/// 路径是否以 `X:`（盘符）或 `\` / `/` 开头
+pub fn fsIsAbs(path: *u8) -> bool {
+    if path[0] == 92 || path[0] == 47 {
+        return true;
+    }
+    if path[0] != 0 && path[1] == 58 {
+        return true;
+    }
+    return false;
+}
+
+/// 拼接目录与相对路径：fsJoin(out, "C:\\dir", "file.txt") → "C:\\dir\\file.txt"
+/// rel 为绝对路径时直接拷贝。
+pub fn fsJoin(out: *u8, dir: *u8, rel: *u8) -> void {
+    if fsIsAbs(rel) {
+        var i: u64 = 0;
+        while rel[i] != 0 {
+            out[i] = rel[i];
+            i = i + 1;
+        }
+        out[i] = 0;
+        return;
+    }
+    var w: u64 = 0;
+    while dir[w] != 0 {
+        out[w] = dir[w];
+        w = w + 1;
+    }
+    if w > 0 && out[w - 1] != 92 && out[w - 1] != 47 {
+        out[w] = 92;
+        w = w + 1;
+    }
+    var j: u64 = 0;
+    while rel[j] != 0 {
+        out[w + j] = rel[j];
+        j = j + 1;
+    }
+    out[w + j] = 0;
+}
+
+// ---------------------------------------------------------------------------
+//  目录
+// ---------------------------------------------------------------------------
+
+/// 创建目录（已存在视为成功）。
+pub fn fsMakeDir(path: *u8) -> bool {
+    var pbuf: [512]u16;
+    let n: u64 = buildNtPath(path, &pbuf[0], 512);
+    if n == 0 {
+        return false;
+    }
+
+    var us: UnicodeString;
+    us.len = (n * 2) as u16;
+    us.maxLen = ((n + 1) * 2) as u16;
+    us.pad = 0;
+    us.buffer = &pbuf[0];
+
+    var oa: ObjectAttributes;
+    oa.length = 48;
+    oa.pad0 = 0;
+    oa.rootDir = 0;
+    oa.name = &us;
+    oa.attrs = 0;
+    oa.pad1 = 0;
+    oa.secDesc = 0;
+    oa.secQos = 0;
+
+    var iosb: IoStatusBlock;
+    var h: u64 = 0;
+    let st: i32 = syscall(gNt.createFile as u64,
+                          &h as u64,
+                          (GENERIC_READ | SYNCHRONIZE) as u64,
+                          &oa as u64,
+                          &iosb as u64,
+                          0,
+                          FILE_ATTRIBUTE_NORMAL as u64,
+                          0,
+                          FILE_OPEN_IF as u64,
+                          (FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as u64,
+                          0,
+                          0);
+    if st < 0 {
+        if st == STATUS_OBJECT_NAME_COLLISION {
+            return true;      // 已存在
+        }
+        return false;
+    }
+    syscall(gNt.close as u64, h);
+    return true;
+}

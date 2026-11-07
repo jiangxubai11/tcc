@@ -1,0 +1,11 @@
+// libtcgfx —— TC64 图形库入口：像素画布 + 颜色
+//
+// 只依赖内存里的像素缓冲，不绑定任何窗口系统 / 平台 API。
+// 想真正显示到屏幕上，再叠加具体平台的呈现层（当前未纳入工具链）。
+//
+// 用法：import "libtcgfx.tc";
+module libtcgfx;
+
+import "tcrt/rt.tc";
+import "tclib/gfx/canvas.tc";
+import "tclib/gfx/color.tc";

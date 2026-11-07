@@ -1,0 +1,102 @@
+// =============================================================================
+//  examples/39_dx/tri.tc — D3D11 绝对最小用例
+// -----------------------------------------------------------------------------
+//  只走这条链：
+//      设备 + 交换链 → 渲染目标 → 视口 → 两个着色器 → Clear → Draw(3) → Present
+//
+//  刻意**不使用**：
+//      · 顶点缓冲（VS 用 SV_VertexID 直接给 NDC 顶点）
+//      · 输入布局（着色器没有任何输入属性）
+//      · 常量缓冲（没有任何矩阵）
+//      · 深度缓冲 / 剔除 / 排序
+//
+//  预期：深蓝背景 + 一个橙黄色的大三角形。
+//  这一条通了，说明基础管线全好，问题一定在「顶点数据路径」；
+//  这一条不通，说明基础管线本身有问题，与顶点数据无关。
+//
+//  编译：build\tcc3.exe examples\39_dx\tri.tc -o examples\39_dx\tri.exe
+// =============================================================================
+
+module dx_tri
+
+import "tcrt/rt.tc"
+import "tclib/win/win32.tc"
+import "tclib/gfx/dx11.tc"
+
+var gRun: bool = true
+var gDx: Dx11
+var gGeom: Geom
+
+fn 过程(h: u64, msg: u32, wp: u64, lp: i64) -> i64 {
+    if msg == 0x0010 {
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    if msg == 0x0002 {
+        gRun = false
+        wcall1(gWin.postQuitMessage, 0)
+        return 0
+    }
+    return wcall4(gWin.defWindowProcW, h, msg as u64, wp, lp as u64) as i64
+}
+
+fn main() -> i32 {
+    if !rtInit() {
+        return 1
+    }
+    if !winInit() {
+        rtPrint("[FAIL] winInit\n")
+        return 2
+    }
+    dxLogOpen()
+    dxLog("进入 main")
+
+    if !winRegisterClassEx("DXTri", 过程, 0, 0x00000000) {
+        dxLog("失败: 注册窗口类")
+        return 4
+    }
+    let w: i32 = 640
+    let h: i32 = 480
+    let hwnd: u64 = winCreateWindowFramed("DXTri", "D3D11 最小三角形", w, h)
+    if hwnd == 0 {
+        dxLog("失败: 创建窗口")
+        return 5
+    }
+    if !dxCreate(&gDx, hwnd, w, h) {
+        rtPrint("[FAIL] D3D11 初始化失败\n")
+        return 6
+    }
+    if !dxMakeTri(&gDx, &gGeom) {
+        rtPrint("[FAIL] 三角形着色器创建失败\n")
+        return 7
+    }
+    winShow(hwnd, SW_SHOW)
+    rtPrint("[OK] 最小三角形已就绪\n")
+
+    var bg: [4]f32
+    bg[0] = 0.10 as f32
+    bg[1] = 0.10 as f32
+    bg[2] = 0.18 as f32
+    bg[3] = 1.0 as f32
+
+    var frame: i32 = 0
+    while winPump() && gRun {
+        if keyDown(27) {
+            break
+        }
+        dxClearColor(&gDx, &bg[0])
+        dxDrawTri(&gDx, &gGeom)
+        dxPresent(&gDx)
+        if frame == 0 {
+            rtPrint("[step] tri frame 0 presented\n")
+        }
+        frame = frame + 1
+        winSleep(16)
+    }
+
+    dxDestroyGeom(&gGeom)
+    dxDestroy(&gDx)
+    dxLogClose()
+    return 0
+}

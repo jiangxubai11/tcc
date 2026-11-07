@@ -1,0 +1,341 @@
+// =============================================================================
+//  tclib/core/std.tc — 标准库补充（补齐设计文档里的英文内建）
+// -----------------------------------------------------------------------------
+//  这些都不需要编译器内建：它们是普通 TC 代码。
+//  只有 input / argc / argv 需要系统调用，留给 rt 层，不在这里。
+// =============================================================================
+
+module tclib.core.std;
+
+import "../../tcrt/rt.tc";
+
+// ---- 字符 ----
+
+/// ord(s)：首字节的编码
+pub fn ord(s: *u8) -> i64 {
+    return s[0] as i64;
+}
+
+// 静态缓冲：语言没有返回字符串字面量的机制，只能写进模块级数组。
+var gChrBuf: [2]u8;
+
+/// chr(c)：把字节编码变成一个 1 字节字符串
+pub fn chr(c: i64) -> *u8 {
+    gChrBuf[0] = c as u8;
+    gChrBuf[1] = 0;
+    return &gChrBuf[0];
+}
+
+// ---- 字符串 ↔ 整数 ----
+
+/// int(s)：十进制解析，允许前导空白与正负号；遇到非数字停止
+pub fn int(s: *u8) -> i64 {
+    var i: u64 = 0;
+    while s[i] == 32 || s[i] == 9 {
+        i = i + 1;
+    }
+    var neg: bool = false;
+    if s[i] == 45 {                       // '-'
+        neg = true;
+        i = i + 1;
+    } else if s[i] == 43 {                // '+'
+        i = i + 1;
+    }
+    var v: i64 = 0;
+    while s[i] >= 48 && s[i] <= 57 {
+        v = v * 10 + ((s[i] - 48) as i64);
+        i = i + 1;
+    }
+    if neg {
+        return 0 - v;
+    }
+    return v;
+}
+
+// 静态缓冲池：4 个槽轮转，这样一次调用里可以同时用多个 str() 结果
+// （例如 print(str(a), str(b))）。
+var gStrPool: [128]u8;
+var gStrSlot: i32 = 0;
+
+/// str(v)：整数转十进制字符串
+pub fn str(v: i64) -> *u8 {
+    var base: u64 = (gStrSlot as u64) * 32;
+    gStrSlot = gStrSlot + 1;
+    if gStrSlot >= 4 {
+        gStrSlot = 0;
+    }
+
+    var neg: bool = false;
+    var x: u64 = v as u64;
+    if v < 0 {
+        neg = true;
+        x = 0 - x;                        // 无符号回绕，INT64_MIN 也正确
+    }
+
+    var tmp: [24]u8;
+    var n: u64 = 0;
+    if x == 0 {
+        tmp[0] = 48;
+        n = 1;
+    } else {
+        while x > 0 {
+            tmp[n] = (48 + (x % 10)) as u8;
+            x = x / 10;
+            n = n + 1;
+        }
+    }
+
+    var w: u64 = base;
+    if neg {
+        gStrPool[w] = 45;
+        w = w + 1;
+    }
+    while n > 0 {
+        n = n - 1;
+        gStrPool[w] = tmp[n];
+        w = w + 1;
+    }
+    gStrPool[w] = 0;
+    return &gStrPool[base];
+}
+
+// ---- 浮点转字符串 ----
+
+// 4 个槽轮转，允许一次调用里同时输出多个 float()
+var gFltPool: [128]u8;
+var gFltSlot: i32 = 0;
+
+/// float(v)：定点 3 位小数（与 rtPrintF64 同一套整数算法，但写进缓冲区）
+pub fn float(v: f64) -> *u8 {
+    var base: u64 = (gFltSlot as u64) * 32;
+    gFltSlot = gFltSlot + 1;
+    if gFltSlot >= 4 {
+        gFltSlot = 0;
+    }
+
+    var neg: bool = false;
+    var x: f64 = v;
+    if x < 0.0 {
+        neg = true;
+        x = 0.0 - x;
+    }
+    let scaled: f64 = x * 1000.0;
+    var n: i64 = 0;
+    if scaled > 9000000000000000.0 {
+        n = 9000000000000000;
+    } else {
+        n = scaled as i64;
+        if scaled - (n as f64) >= 0.5 {
+            n = n + 1;
+        }
+    }
+    let ip: i64 = n / 1000;
+    let fp: i64 = n % 1000;
+
+    var w: u64 = base;
+    if neg {
+        gFltPool[w] = 45;
+        w = w + 1;
+    }
+
+    # 整数部分
+    var tmp: [24]u8;
+    var ti: u64 = 0;
+    var xi: u64 = ip as u64;
+    if xi == 0 {
+        tmp[0] = 48;
+        ti = 1;
+    } else {
+        while xi > 0 {
+            tmp[ti] = (48 + (xi % 10)) as u8;
+            xi = xi / 10;
+            ti = ti + 1;
+        }
+    }
+    while ti > 0 {
+        ti = ti - 1;
+        gFltPool[w] = tmp[ti];
+        w = w + 1;
+    }
+
+    # 小数点与 3 位小数
+    gFltPool[w] = 46;
+    w = w + 1;
+    let f0: i64 = fp / 100;
+    let f1: i64 = (fp % 100) / 10;
+    let f2: i64 = fp % 10;
+    gFltPool[w] = (48 + f0) as u8; w = w + 1;
+    gFltPool[w] = (48 + f1) as u8; w = w + 1;
+    gFltPool[w] = (48 + f2) as u8; w = w + 1;
+    gFltPool[w] = 0;
+    return &gFltPool[base];
+}
+
+// ---- 命令行参数 ----
+//
+// 经 PEB 直读命令行（与 tc_main 里 exeDir 同一套路）。
+// 限制：只做 ASCII 简化解析 —— 非 ASCII 字符一律记成 '?'。
+// 需要完整 Unicode 支持时，应当先把命令行转成 UTF-8 再做拆分。
+
+var gArgcVal: i32 = -1;
+var gArgvCount: i32 = 0;
+var gArgvBuf: [1024]u8;          // 最多 8 个参数 × 128 字节
+var gArgvEmpty: [1]u8;
+
+fn parseCmdline() -> void {
+    if gArgcVal >= 0 {
+        return;
+    }
+    gArgcVal = 0;
+    gArgvEmpty[0] = 0;
+
+    let peb: *u8 = read_gs(0x60) as *u8;
+    if (peb as u64) == 0 { return; }
+    let pp: *u8 = (*((peb + 0x20) as *u64)) as *u8;
+    if (pp as u64) == 0 { return; }
+    let clen: u16 = *((pp + 0x70) as *u16);
+    if clen == 0 { return; }
+    let cbuf: *u16 = (*((pp + 0x78) as *u64)) as *u16;
+    if (cbuf as u64) == 0 { return; }
+
+    let n: u64 = (clen as u64) / 2;
+    var i: u64 = 0;
+    var w: u64 = 0;
+    var inArg: bool = false;
+    while i < n {
+        let ch: u16 = cbuf[i];
+        if ch == 32 || ch == 9 {
+            if inArg {
+                if gArgvCount < 8 {
+                    gArgvBuf[(gArgvCount as u64) * 128 + w] = 0;
+                    gArgvCount = gArgvCount + 1;
+                }
+                w = 0;
+                inArg = false;
+            }
+        } else if ch == 34 {
+            inArg = true;
+        } else {
+            inArg = true;
+            if gArgvCount < 8 {
+                let base: u64 = (gArgvCount as u64) * 128;
+                // UTF-16 码元 → UTF-8（BMP 内 1~3 字节）。
+                // 早期实现把非 ASCII 一律记成 '?'，导致含中文的路径
+                // （如 build\_setup_out\示例\player.tc）直接打不开。
+                // 代理对（U+10000 以上）暂仍记 '?'——中文/日文/西文都在 BMP 内。
+                if ch < 0x80 {
+                    if w < 127 {
+                        gArgvBuf[base + w] = ch as u8;
+                        w = w + 1;
+                    }
+                } else if ch < 0x800 {
+                    if w < 126 {
+                        gArgvBuf[base + w] = ((0xC0 as u16) | (ch >> 6)) as u8;
+                        w = w + 1;
+                        gArgvBuf[base + w] = ((0x80 as u16) | (ch & 0x3F)) as u8;
+                        w = w + 1;
+                    }
+                } else if ch >= 0xD800 && ch <= 0xDFFF {
+                    if w < 127 {
+                        gArgvBuf[base + w] = 63;
+                        w = w + 1;
+                    }
+                } else {
+                    if w < 125 {
+                        gArgvBuf[base + w] = ((0xE0 as u16) | (ch >> 12)) as u8;
+                        w = w + 1;
+                        gArgvBuf[base + w] = ((0x80 as u16) | ((ch >> 6) & 0x3F)) as u8;
+                        w = w + 1;
+                        gArgvBuf[base + w] = ((0x80 as u16) | (ch & 0x3F)) as u8;
+                        w = w + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if inArg && gArgvCount < 8 {
+        gArgvBuf[(gArgvCount as u64) * 128 + w] = 0;
+        gArgvCount = gArgvCount + 1;
+    }
+    gArgcVal = gArgvCount;
+}
+
+/// argc()：参数个数（含程序自身路径）
+pub fn argc() -> i32 {
+    parseCmdline();
+    return gArgcVal;
+}
+
+/// argv(i)：第 i 个参数；越界返回空串
+pub fn argv(i: i32) -> *u8 {
+    parseCmdline();
+    if i < 0 || i >= gArgcVal {
+        return &gArgvEmpty[0];
+    }
+    return &gArgvBuf[(i as u64) * 128];
+}
+
+// ---- 标准输入 ----
+
+var gInBuf: [256]u8;
+
+/// input()：从标准输入读一行（最多 255 字节），去掉行尾 CR/LF。
+///
+/// 复用 rtFileRead：构造一个指向 stdin 句柄的 File 即可，不必自己发 syscall。
+/// 注意：控制台子系统（-console）下才有效；GUI 程序没有 stdin，会返回空串。
+/// 读不到数据时同样返回空串，不会阻塞报错。
+pub fn input() -> *u8 {
+    gInBuf[0] = 0;
+
+    var f: File;
+    f.ok = true;
+    f.handle = gStdIn;
+
+    let n: u64 = rtFileRead(&f, &gInBuf[0], 255);
+    if n == 0 {
+        gInBuf[0] = 0;
+        return &gInBuf[0];
+    }
+
+    # 剥掉尾部所有控制 / 空白字节。
+    #
+    # 实测控制台行编辑器返回的并不只是 "行 + \r\n"：读 "hello world" 得到的是
+    #   h e l l o _ w o r l d 空格 NUL LF
+    # 也就是说尾部会带上空格、NUL、LF 等杂字节。所以这里不针对某一种换行，
+    # 而是把尾部所有 <= 32 的字节一律剥掉（空格 / NUL / CR / LF / TAB）。
+    var len: u64 = 0;
+    while len < n && gInBuf[len] != 0 {
+        len = len + 1;
+    }
+    while len > 0 && gInBuf[len - 1] <= 32 {
+        len = len - 1;
+    }
+    gInBuf[len] = 0;
+    return &gInBuf[0];
+}
+
+// ---- 数学补充 ----
+
+/// tan(x)：语言没有 tan 内建，用 sin/cos 代换
+pub fn tan(x: f64) -> f64 {
+    return sin(x) / cos(x);
+}
+
+// ---- 进程与断言 ----
+
+/// exit(code)：立即退出
+pub fn exit(code: i32) -> void {
+    rtExit(code);
+}
+
+/// assertT(cond, msg)：条件不成立时打印信息并退出（退出码 1）
+/// 语言没有重载，也不做宏，所以名字带 T（test）后缀。
+pub fn assertT(cond: bool, msg: *u8) -> void {
+    if !cond {
+        rtPrint("assert failed: ");
+        rtPrint(msg);
+        rtPrint("\n");
+        rtExit(1);
+    }
+}
